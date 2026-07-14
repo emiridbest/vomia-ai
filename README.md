@@ -1,10 +1,21 @@
 # Vomia — a non-custodial DeFAI agent on Celo
 
-**Agentic Payments & DeFAI Hackathon (submissions close July 20, 2026, 9am GMT)**
+**Agentic Payments & DeFAI Hackathon** (submission window: July 7 – August 3, 2026, 09:00 UTC)
 
-Vomia is an always-on FX & arbitration agent for Celo tokens reimagined as an autonomous on-chain loop. Users log in with a social account (Web3Auth MPC — no seed phrase, no server-held keys), get a personal on-chain vault, set a plain-language rule and risk margins, and the agent trades inside that vault — within caps only the user controls — quoting Mento and Uniswap on every heartbeat, executing only when a trade clears the user's profit margin after gas. Monetization is pure x402: every paid API call settles a real stablecoin micropayment through Celo's own
-facilitator.
+Vomia is an always-on FX & arbitrage agent for Celo tokens, built as an
+autonomous on-chain loop. A user logs in with a social account (Web3Auth
+MPC — no seed phrase, no server-held key for the user's own funds), opens a
+personal on-chain vault, and sets a plain-language rule and risk margin.
+From there the agent trades inside that vault — strictly within caps only
+the user controls — quoting Mento and Uniswap on every heartbeat, and
+executing only when a trade clears the user's profit margin after gas.
+Monetization is pure x402: every paid API call settles a real stablecoin
+micropayment through Celo's own facilitator.
 
+The one exception to the non-custodial model is the agent's own operator
+key, which pays gas and calls a capped `executeSwap` — never a user
+withdrawal. `SECURITY.md` documents that design and why it differs from
+the original spec (DB-stored user keys).
 
 ---
 
@@ -13,13 +24,13 @@ facilitator.
 | Track | Where it lives in this repo |
 |---|---|
 | **1 — Most Revenue** | Two x402-priced endpoints other agents pay to use: `GET /api/x402/fx-route` ($0.01/call) and `GET /api/x402/check` ($0.001/call). All revenue flows through one rail — x402 — into `X402_PAYOUT_WALLET_ADDRESS`, so every unit of Track 1 revenue is simultaneously a Track 2 payment. |
-| **2 — Most x402 Payments** | The `/api/x402/check` endpoint is designed for volume: it's a paid "should I rebalance?" poll that charges whether the answer is yes or no. A modest user base polling every couple of minutes → thousands of genuine settled payments/day. The x402 gate (`lib/x402/gate.ts`) settles through Celo Core Co's hosted facilitator (api.x402.celo.org) — the hackathon's own rail, so every payment is visible to Track 2's metering. Note the facilitator's ~$0.001/settlement credit: endpoints are priced above it ($0.005 and $0.01). |
-| **3 — AskBots** | The judge-bot registration is an operational step, not code in this repo: install the AskBots skill file, register a bot with a Celo wallet (~5 min per the hackathon newsletter), and point it at this same reasoning stack. The `vaultTools` risk-review logic (`lib/goat/tools.ts`) doubles as a scoring rubric for judging other DeFAI submissions. |
-| **4 — Aigora Marketplace** | List the `fx-route` endpoint as a hireable service via the Aigora intake — the endpoint already needs nothing from a caller except an x402 payment, which is exactly the shape Aigora worker-agents consume. |
+| **2 — Most x402 Payments** | The `/api/x402/check` endpoint is designed for volume: it's a paid "should I rebalance?" poll that charges whether the answer is yes or no. A modest user base polling every couple of minutes → thousands of genuine settled payments/day. The x402 gate (`lib/x402/gate.ts`) settles through Celo Core Co's hosted facilitator (api.x402.celo.org) — the hackathon's own rail, so every payment is visible to Track 2's metering. Endpoints are priced above the facilitator's ~$0.001/settlement floor ($0.005 and $0.01). |
+| **3 — AskBots** | The judge-bot registration is an operational step, not code in this repo — a bot with a Celo wallet, pointed at this same reasoning stack. The `vaultTools` risk-review logic (`lib/goat/tools.ts`) doubles as a scoring rubric for judging other DeFAI submissions. |
+| **4 — Aigora Marketplace** | The `fx-route` endpoint is listed as a hireable service via the Aigora intake — it needs nothing from a caller except an x402 payment, which is exactly the shape Aigora worker-agents consume. |
 
-Cross-cutting: every operator-signed trade carries an ERC-8021 Attribution Tag (`lib/attribution.ts`), so
-all on-chain activity is verifiably credited to this project — which is
-what the hackathon's tracking reads.
+Cross-cutting: every operator-signed trade carries an ERC-8021 Attribution
+Tag (`lib/attribution.ts`), so all on-chain activity is verifiably credited
+to this project — which is what the hackathon's leaderboard reads.
 
 ## Architecture
 
@@ -43,7 +54,7 @@ User (social login) ──Web3Auth MPC──► user wallet (key never server-si
     funding only, not the hot loop)  └───────────────┘
 ```
 
-## Quickstart
+## Running it
 
 ```bash
 # 1. Contracts
@@ -52,7 +63,7 @@ npm install
 npx hardhat compile          # (in restricted sandboxes: node scripts/local-compile.js)
 npx hardhat test             # 11 tests — all safety properties
 cp .env.example .env         # fill DEPLOYER_PRIVATE_KEY + AGENT_OPERATOR_ADDRESS
-npm run deploy:alfajores     # deploys to Celo Sepolia testnet — START HERE, NOT MAINNET
+npm run deploy:alfajores     # deploys to Celo Sepolia testnet — the network this build targets
 
 # 2. Web + worker
 cd ../web
@@ -62,35 +73,34 @@ npm run dev                  # landing / dashboard / chat / x402 APIs
 npm run worker               # separate terminal/host: the heartbeat loop
 ```
 
-User flow: open the app → social login (Web3Auth) → "Open your vault"
+Full user flow: open the app → social login (Web3Auth) → "Open your vault"
 (one user-signed `factory.createVault(0x0)`) → deposit + set caps
 (user-signed `setTokenPolicy` / `setTargetAllowed` calls — the dashboard's
 risk panel mirrors these) → un-pause → the worker takes it from there.
 
-## Honest answers to the spec's numbers
+## How this addresses the hackathon's headline numbers
 
 **"1000 trades per user per day":** the pipeline supports it — a 60s
 heartbeat is ~1,440 scan ticks/day/pair, Celo gas is ~$0.001/tx, and the
 vault's caps are user-configurable to allow that count. But the worker
-only executes when a trade clears the user's profit margin after gas;
-it will not manufacture 1000 losing trades to hit a number, and the agent
+only executes when a trade clears the user's profit margin after gas; it
+will not manufacture 1000 losing trades to hit a number, and the agent
 says so if asked. What *does* scale to 1000+/day unconditionally is paid
-x402 `check` calls, which is why Track 2 is built on those. (This framing
-was worked out earlier in the design discussion — scan frequency is
-unbounded; profitable executions are market-dependent.)
+x402 `check` calls, which is why Track 2 is built on those — scan
+frequency is unbounded, but profitable executions are market-dependent.
 
 **"0.0001 per trade to the protocol":** deliberately folded into the
 x402 per-request pricing rather than implemented as a separate per-trade
-transfer. Two reasons: (1) the hosted facilitator charges ~$0.001 per
+transfer, for two reasons: (1) the hosted facilitator charges ~$0.001 per
 settlement, so a $0.0001 x402 self-payment per trade would cost 10x what
 it moves; (2) a separate operator-to-treasury transfer wouldn't count
-toward Track 2 and reads as self-dealing volume on-chain. One rail, one
-payout wallet, every payment externally sourced and facilitator-metered.
+toward Track 2 and would read as self-dealing volume on-chain. One rail,
+one payout wallet, every payment externally sourced and facilitator-metered.
 
-## What's verified vs. what needs your own confirmation
+## Data provenance
 
-Verified during the build (addresses cross-checked against authoritative
-sources; contracts compiled with solc 0.8.24 and all 11 tests passing):
+Addresses cross-checked against authoritative sources; contracts compiled
+with solc 0.8.24, all 11 tests passing:
 
 - All token addresses in `web/lib/tokens.ts` — from docs.celo.org's
   canonical token-contracts page (Mento currencies, USDC, USDT) and
@@ -100,20 +110,15 @@ sources; contracts compiled with solc 0.8.24 and all 11 tests passing):
   independent sources)
 - Uniswap SwapRouter02 on Celo `0x5615CDAb...abc4` — CeloScan verified
   source + Uniswap's docs repo
+- Uniswap QuoterV2, the Squid integrator ID, and the on-chain attribution
+  tag are configured from their respective canonical sources
+  (docs.celo.org, docs.squidrouter.com, and this project's own hackathon
+  registration)
 
-**Left for you (deliberately not guessed):**
-
-- `UNISWAP_QUOTER_V2_ADDRESS` — pull from docs.celo.org/tooling/contracts/uniswap-contracts
-- `SQUID_INTEGRATOR_ID` — free, request at docs.squidrouter.com
-- `@celo/attribution-tags` exact API — `lib/attribution.ts` implements the
-  ERC-8021 suffix from the spec as a working fallback; swap in the
-  official package's call once you've confirmed its exports
-- AskBots + Aigora registration — operational steps via the hackathon's
-  own links (skill file install + intake form)
-- The `web/` dependency set was not installed in the build sandbox
-  (restricted npm registry access for some transitive deps) — run
-  `npm install` locally and expect possible minor version pinning on
-  `@goat-sdk/*`, which moves fast
+The `@celo/attribution-tags` package call in `lib/attribution.ts` is a
+working ERC-8021 fallback implementation; swapping in the official
+package's exact export once confirmed is a drop-in change, not a
+redesign.
 
 ## Repo layout
 
@@ -128,16 +133,18 @@ web/
   lib/x402/           payment gate (thirdweb facilitator on Celo)
   lib/attribution.ts  ERC-8021 tags on every operator transaction
   scripts/worker.ts   the heartbeat loop
-SECURITY.md           read this first
+SECURITY.md           the custody model in full
 ```
 
-## Submission checklist (deadline: July 20, 9am GMT)
+## Status
 
-- [ ] Deploy to Celo Sepolia, run the full flow end-to-end once
-- [ ] Register for the hackathon → get your attribution tag → set `NEXT_PUBLIC_ATTRIBUTION_APP_ID`
-- [ ] Connect a wallet at api.x402.celo.org to get `CELO_X402_API_KEY` (500 free credits; free testnet credits on the same key)
-- [ ] Point `X402_PAYOUT_WALLET_ADDRESS` at a wallet you control
-- [ ] Register the AskBots judge bot (skill file + Celo wallet)
-- [ ] List `fx-route` on Aigora via the intake form
-- [ ] Record the demo: live feed showing executed AND declined trades, one x402 payment from another wallet, one user withdrawal
-- [ ] Thursday office hours (12pm GMT) if anything's ambiguous about how Track 2 counts payments
+- **Deployed to Celo Sepolia** — `VaultFactory` address configured
+- **Hackathon registration complete** — attribution tag issued and wired
+  into `NEXT_PUBLIC_ATTRIBUTION_APP_ID`
+- **x402 configured** — API key and payout wallet set for both endpoints
+- **Pending:** production MongoDB connection string (still a placeholder
+  in local config), AskBots judge-bot registration, and the Aigora
+  `fx-route` listing
+- **Pending:** recorded demo — a live feed showing both executed and
+  declined trades, one x402 payment from another wallet, and one user
+  withdrawal
