@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "worker": "node --env-file=.env.local --import tsx scripts/worker.ts"
+    "worker": "node --env-file-if-exists=.env.local --import tsx scripts/worker.ts"
   },
   "dependencies": {
     "next": "^14.2.5",
