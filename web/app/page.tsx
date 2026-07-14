@@ -67,7 +67,7 @@ export default function Landing() {
         <div className="hero">
           <div>
             <h1>
-              The savings circle,<br />
+              The profit circle,<br />
               running <em>itself</em>.
             </h1>
             <p className="sub">
