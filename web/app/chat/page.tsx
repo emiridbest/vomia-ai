@@ -1,23 +1,27 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChat } from "ai/react";
 import Link from "next/link";
+import { useSendTransaction } from "wagmi";
+import ConnectWalletButton from "../components/ConnectWalletButton";
+import { useVomiaIdentity } from "../hooks/useVomiaIdentity";
 
 /**
  * Chat UI — a leaner rebuild of the original Vomia chat component in this
  * project's design system. The important behavioral change: when the agent
  * returns a prepareWithdrawal tool result (requiresUserSignature: true),
  * this UI is where the user's OWN Web3Auth wallet gets popped to sign it.
- * Wire `sendUserTransaction` below to your Web3Auth/wagmi signer — left as
- * an explicit seam because the signer object comes from your provider setup.
  */
 export default function ChatPage() {
   const endRef = useRef<HTMLDivElement>(null);
+  const { address } = useVomiaIdentity();
+  const { sendTransactionAsync } = useSendTransaction();
+  const [signStatus, setSignStatus] = useState<{ id: string; text: string } | null>(null);
 
   const { messages, input, setInput, handleSubmit, isLoading, append } = useChat({
     api: "/api/chat",
-    // body: { userAddress } — supply from your Web3Auth/wagmi hook once the provider is mounted
+    body: { userAddress: address },
   });
 
   useEffect(() => {
@@ -31,6 +35,16 @@ export default function ChatPage() {
     "Withdraw 10 USDm back to my wallet",
   ];
 
+  async function signAndSend(toolCallId: string, result: { to: `0x${string}`; data: `0x${string}`; summary: string }) {
+    setSignStatus({ id: toolCallId, text: "Confirm in your wallet…" });
+    try {
+      const hash = await sendTransactionAsync({ to: result.to, data: result.data });
+      setSignStatus({ id: toolCallId, text: `Sent: ${hash.slice(0, 10)}…` });
+    } catch (err: any) {
+      setSignStatus({ id: toolCallId, text: `Failed: ${err?.message || "signature declined"}` });
+    }
+  }
+
   return (
     <div className="container">
       <nav className="topbar">
@@ -39,7 +53,10 @@ export default function ChatPage() {
           <Link href="/">Home</Link>
           <Link href="/dashboard">Dashboard</Link>
         </div>
-        <span className="badge-live">CELO · AGENT LIVE</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <ConnectWalletButton />
+          <span className="badge-live">CELO · AGENT LIVE</span>
+        </div>
       </nav>
 
       <div className="chat-shell">
@@ -68,10 +85,16 @@ export default function ChatPage() {
                         <button
                           className="btn btn-ghost"
                           style={{ padding: "4px 10px", marginLeft: 8 }}
-                          onClick={() => sendUserTransaction(t.result)}
+                          onClick={() => signAndSend(t.toolCallId, t.result)}
+                          disabled={signStatus?.id === t.toolCallId && signStatus?.text === "Confirm in your wallet…"}
                         >
                           Sign in wallet
                         </button>
+                        {signStatus && signStatus.id === t.toolCallId && (
+                          <span style={{ marginLeft: 8, fontSize: "0.82rem", color: "var(--cream-dim)" }}>
+                            {signStatus.text}
+                          </span>
+                        )}
                       </>
                     )}
                   </div>
@@ -97,20 +120,5 @@ export default function ChatPage() {
         </form>
       </div>
     </div>
-  );
-}
-
-/**
- * Seam for the user-signed withdrawal: receives { to, data, summary } from
- * the prepareWithdrawal tool. Replace the alert with your Web3Auth/wagmi
- * sendTransaction — e.g.:
- *   const { sendTransactionAsync } = useSendTransaction();
- *   await sendTransactionAsync({ to: result.to, data: result.data });
- * Kept out of the component body here so the page renders without the
- * wallet provider mounted.
- */
-function sendUserTransaction(result: { to: `0x${string}`; data: `0x${string}`; summary: string }) {
-  alert(
-    `Wire this to your Web3Auth signer:\n\n${result.summary}\n\nto: ${result.to}\ndata: ${result.data.slice(0, 42)}…`
   );
 }

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import ConnectWalletButton from "./components/ConnectWalletButton";
 
 /**
  * Landing page. Structure intentionally parallels what works about
@@ -57,7 +58,10 @@ export default function Landing() {
             <Link href="/chat">Agent chat</Link>
             <a href="https://docs.celo.org/build-on-celo/build-with-ai/x402" target="_blank" rel="noreferrer">x402 docs</a>
           </div>
-          <span className="badge-live">CELO · AGENT LIVE</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <ConnectWalletButton />
+            <span className="badge-live">CELO · AGENT LIVE</span>
+          </div>
         </nav>
 
         <div className="hero">

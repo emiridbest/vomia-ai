@@ -7,3 +7,5 @@ cache/
 typechain-types/
 dist/
 SECURITY.md
+next-env.d.ts
+*.tsbuildinfo

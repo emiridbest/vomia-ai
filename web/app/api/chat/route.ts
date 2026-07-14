@@ -131,7 +131,7 @@ export async function POST(req: Request) {
       }),
     };
 
-    const result = streamText({
+    const result = await streamText({
       model: openai("gpt-4o-mini") as LanguageModelV1,
       system: `
 You are Vomia, an autonomous savings & FX agent on the Celo blockchain (Chain ID 42220).

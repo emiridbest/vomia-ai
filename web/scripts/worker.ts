@@ -21,7 +21,6 @@
  * idempotency exists to catch, but there's no reason to lean on the last
  * line of defense by design.
  */
-import "dotenv/config";
 import { connectDB } from "../lib/db/connection";
 import { User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
