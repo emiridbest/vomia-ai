@@ -17,7 +17,7 @@ import { z } from "zod";
 import { createPublicClient, http, type Address } from "viem";
 import { celo } from "viem/chains";
 import { rpcUrl } from "../chains";
-import { TOKENS, type TokenSymbol } from "../tokens";
+import { DEFAULT_STRATEGY_TOKENS, TOKENS, type TokenSymbol } from "../tokens";
 import { reviewProposedProfile, DEFAULT_RISK_PROFILE } from "../strategy/riskProfile";
 import { connectDB } from "../db/connection";
 import { RiskProfile as RiskProfileModel, User } from "../db/models";
@@ -40,6 +40,13 @@ const VAULT_READ_ABI = [
     inputs: [{ name: "token", type: "address" }],
     outputs: [{ type: "uint256" }],
   },
+  {
+    type: "function",
+    name: "allowedTokens",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "address" }],
+    outputs: [{ type: "bool" }],
+  },
 ] as const;
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
@@ -58,23 +65,26 @@ export function vaultTools(vaultAddress: Address | null, userId: string | null, 
 
     getVaultStatus: tool({
       description:
-        "Read the user's own vault: whether it's paused, which tokens have a balance, and remaining daily trading allowance per token. Use this before answering any question about balances or agent status.",
+        "Read the user's own vault: whether it's paused, and for each token — whether it's allow-listed for trading, its balance, and remaining daily trading allowance. Use this before answering ANY question about balances or agent status. Omit 'tokens' to check the full default token set (USDm, KESm, NGNm, EURm, USDC, USDT, CELO) — always do this unless the user named specific tokens, since checking only a couple and reporting 'the vault only supports X' would be wrong: allowed=false just means that token isn't allow-listed yet, not that it can't be.",
       parameters: z.object({
-        tokens: z.array(z.string()).describe("Token symbols to check, e.g. ['USDm', 'KESm']"),
+        tokens: z.array(z.string()).optional().describe("Token symbols to check. Omit to check the full default set."),
       }),
       execute: async ({ tokens }) => {
         if (!vaultAddress) return { error: "This user hasn't created a vault yet — direct them to the dashboard to create one first." };
+        const symbols = tokens && tokens.length > 0 ? tokens : DEFAULT_STRATEGY_TOKENS;
         const [paused] = await Promise.all([publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "paused" })]);
         const balances = await Promise.all(
-          tokens.map(async (symbol) => {
+          symbols.map(async (symbol) => {
             const info = TOKENS[symbol as TokenSymbol];
             if (!info) return { symbol, error: "unknown token" };
-            const [balance, remaining] = await Promise.all([
+            const [allowed, balance, remaining] = await Promise.all([
+              publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "allowedTokens", args: [info.address] }),
               publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "tokenBalance", args: [info.address] }),
               publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "remainingDailyAllowance", args: [info.address] }),
             ]);
             return {
               symbol,
+              allowed,
               balance: (Number(balance) / 10 ** info.decimals).toString(),
               remainingDailyAllowance: (Number(remaining) / 10 ** info.decimals).toString(),
             };

@@ -151,6 +151,7 @@ RISK NEGOTIATION (important):
 
 RESPONSE RULES:
 - Never hallucinate transaction hashes. Only report a hash a tool actually returned.
+- Never claim a token "isn't supported" or generalize about what the vault can/can't hold from a partial getVaultStatus check. That tool's allowed field is the only source of truth for whether a token is allow-listed — a token you didn't check is unknown, not unsupported.
 - Keep answers short and concrete. Amounts always with token symbols.
       `,
       // @ts-ignore
