@@ -5,10 +5,12 @@ import { useAccount } from "wagmi";
 
 /**
  * The one place that turns a Web3Auth session into what the rest of the app
- * needs: the user's own wallet address (for on-chain reads/writes) and a
- * stable web3AuthSub (for the User record in lib/db/models.ts). Neither
- * value is ever generated or held server-side — both come straight out of
- * this client-side session.
+ * needs: the user's own wallet address (for on-chain reads/writes, and the
+ * primary key for the User record in lib/db/models.ts) and, opportunistically,
+ * a web3AuthSub. address comes from wagmi and is available as soon as
+ * isConnected is true; web3AuthSub comes from an async getUserInfo() call
+ * that can be slow or fail outright, so nothing in this app is allowed to
+ * block on it — it's attached to records when available, never required.
  */
 export function useVomiaIdentity() {
   const { connect, loading: connecting, isConnected } = useWeb3AuthConnect();

@@ -18,7 +18,7 @@ const FACTORY_ABI = [
 ] as const;
 
 /**
- * GET /api/vault?web3AuthSub=...&walletAddress=...
+ * GET /api/vault?walletAddress=...
  * Looks up the user's vault, checking the factory directly on-chain so this
  * is never out of sync with reality even if the DB record is stale/missing.
  */
@@ -54,8 +54,8 @@ export async function POST(req: NextRequest) {
   const body = await req.json();
   const { web3AuthSub, walletAddress, vaultAddress } = body ?? {};
 
-  if (!web3AuthSub || !isAddress(walletAddress) || !isAddress(vaultAddress)) {
-    return NextResponse.json({ error: "web3AuthSub, walletAddress, and vaultAddress are all required" }, { status: 400 });
+  if (!isAddress(walletAddress) || !isAddress(vaultAddress)) {
+    return NextResponse.json({ error: "walletAddress and vaultAddress are required" }, { status: 400 });
   }
 
   // Trust but verify: confirm this vault really is what the factory has on
@@ -73,11 +73,9 @@ export async function POST(req: NextRequest) {
   }
 
   await connectDB();
-  const user = await User.findOneAndUpdate(
-    { web3AuthSub },
-    { web3AuthSub, walletAddress, vaultAddress },
-    { upsert: true, new: true }
-  );
+  const update: Record<string, unknown> = { walletAddress, vaultAddress };
+  if (web3AuthSub) update.web3AuthSub = web3AuthSub;
+  const user = await User.findOneAndUpdate({ walletAddress }, update, { upsert: true, new: true });
 
   return NextResponse.json({ user });
 }

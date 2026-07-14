@@ -20,8 +20,8 @@ import mongoose, { Schema, model, models } from "mongoose";
 // User — links a Web3Auth identity to their on-chain vault. No secrets.
 // ---------------------------------------------------------------------
 export interface UserDoc {
-  web3AuthSub: string; // Web3Auth's stable per-user subject id (from the social login)
-  walletAddress: string; // the user's own address, derived client-side by Web3Auth — public info
+  walletAddress: string; // the user's own address, derived client-side by Web3Auth — public info. Primary key.
+  web3AuthSub?: string; // Web3Auth's stable per-user subject id, when available (its own fetch can be flaky/slow — never block on it)
   vaultAddress?: string; // this user's AgentVault clone, once created
   minipayDetected: boolean;
   createdAt: Date;
@@ -30,8 +30,8 @@ export interface UserDoc {
 
 const UserSchema = new Schema<UserDoc>(
   {
-    web3AuthSub: { type: String, required: true, unique: true, index: true },
-    walletAddress: { type: String, required: true, index: true },
+    walletAddress: { type: String, required: true, unique: true, index: true },
+    web3AuthSub: { type: String, index: true, sparse: true },
     vaultAddress: { type: String },
     minipayDetected: { type: Boolean, default: false },
   },
@@ -58,7 +58,7 @@ export interface RiskProfileDoc {
 
 const RiskProfileSchema = new Schema<RiskProfileDoc>(
   {
-    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    userId: { type: Schema.Types.ObjectId, ref: "VomiaUser", required: true, unique: true },
     minProfitBps: { type: Number, default: 15, min: 0 },
     maxSlippageBps: { type: Number, default: 100, min: 0, max: 2000 },
     maxTradesPerDay: { type: Number, default: 50, min: 0 },
@@ -102,7 +102,7 @@ export interface TradeLogDoc {
 
 const TradeLogSchema = new Schema<TradeLogDoc>(
   {
-    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    userId: { type: Schema.Types.ObjectId, ref: "VomiaUser", required: true, index: true },
     vaultAddress: { type: String, required: true, index: true },
     actionId: { type: String, required: true, unique: true },
     strategy: { type: String, enum: ["rebalance", "arbitrage", "remittance", "dca", "price-check"], required: true },
@@ -123,6 +123,12 @@ const TradeLogSchema = new Schema<TradeLogDoc>(
   { timestamps: { createdAt: true, updatedAt: false } }
 );
 
-export const User = models.User || model<UserDoc>("User", UserSchema);
-export const RiskProfile = models.RiskProfile || model<RiskProfileDoc>("RiskProfile", RiskProfileSchema);
-export const TradeLog = models.TradeLog || model<TradeLogDoc>("TradeLog", TradeLogSchema);
+// Model + collection names are prefixed "Vomia"/"vomia_" on purpose: MONGODB_URI
+// points at a shared cluster with no database name in the connection string
+// (so it lands in that cluster's default database), and generic names like
+// "User" risk colliding with another project's collection there.
+export const User = models.VomiaUser || model<UserDoc>("VomiaUser", UserSchema, "vomia_users");
+export const RiskProfile =
+  models.VomiaRiskProfile || model<RiskProfileDoc>("VomiaRiskProfile", RiskProfileSchema, "vomia_risk_profiles");
+export const TradeLog =
+  models.VomiaTradeLog || model<TradeLogDoc>("VomiaTradeLog", TradeLogSchema, "vomia_trade_logs");

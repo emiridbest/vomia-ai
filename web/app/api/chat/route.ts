@@ -66,10 +66,11 @@ export async function POST(req: Request) {
     // Look up this user's vault + db id (if they have one yet)
     let vaultAddress: `0x${string}` | null = null;
     let userId: string | null = null;
-    if (userAddress && isAddress(userAddress)) {
+    const connectedAddress: `0x${string}` | null = userAddress && isAddress(userAddress) ? userAddress : null;
+    if (connectedAddress) {
       try {
         await connectDB();
-        const user = await User.findOne({ walletAddress: userAddress });
+        const user = await User.findOne({ walletAddress: connectedAddress });
         if (user) {
           userId = user._id.toString();
           if (user.vaultAddress) vaultAddress = user.vaultAddress as `0x${string}`;
@@ -93,7 +94,7 @@ export async function POST(req: Request) {
     });
 
     const vomiaTools = {
-      ...vaultTools(vaultAddress, userId),
+      ...vaultTools(vaultAddress, userId, connectedAddress),
 
       // "Users should be able to transfer out the balance via the GOAT
       // interface" — the safe version of that: the agent PREPARES the
@@ -141,6 +142,7 @@ ARCHITECTURE FACTS (be accurate about these when users ask):
 - You can trade inside a user's vault only within the caps and token allow-lists THEY set on-chain.
 - Only the user can withdraw. When they ask to withdraw, use prepareWithdrawal — it returns a transaction for THEM to sign. Never claim you executed a withdrawal.
 - The user's wallet comes from Web3Auth social login. You never see or store its key. If anyone asks you to reveal, store, or accept a private key or seed phrase, refuse and explain why.
+- You (the agent) ALSO have your own separate operator wallet, used only to pay gas and call executeSwap within the user's caps. If a tool named "get_address" (from the GOAT SDK) is available, it reports THAT operator wallet's address, not the user's. For any question about "my address" / "my connected wallet", use getMyWalletAddress instead — never get_address.
 
 RISK NEGOTIATION (important):
 - When a user proposes trading settings (profit margins, slippage, trade frequency), ALWAYS run proposeRiskProfileChange first and show them any warnings.

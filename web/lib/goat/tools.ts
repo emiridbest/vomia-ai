@@ -44,8 +44,18 @@ const VAULT_READ_ABI = [
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
 
-export function vaultTools(vaultAddress: Address | null, userId: string | null) {
+export function vaultTools(vaultAddress: Address | null, userId: string | null, userAddress: Address | null) {
   return {
+    getMyWalletAddress: tool({
+      description:
+        "Get the USER's own connected wallet address (from their Web3Auth login). Use this for any question about 'my address' or 'my connected wallet' — do NOT use GOAT's generic get_address tool for this, which reports the agent's own operator wallet, not the user's.",
+      parameters: z.object({}),
+      execute: async () => {
+        if (!userAddress) return { error: "No wallet connected yet." };
+        return { address: userAddress };
+      },
+    }),
+
     getVaultStatus: tool({
       description:
         "Read the user's own vault: whether it's paused, which tokens have a balance, and remaining daily trading allowance per token. Use this before answering any question about balances or agent status.",

@@ -1,14 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isAddress } from "viem";
 import { connectDB } from "../../../lib/db/connection";
 import { RiskProfile, User } from "../../../lib/db/models";
 import { reviewProposedProfile, DEFAULT_RISK_PROFILE } from "../../../lib/strategy/riskProfile";
 
 export async function GET(req: NextRequest) {
-  const web3AuthSub = req.nextUrl.searchParams.get("web3AuthSub");
-  if (!web3AuthSub) return NextResponse.json({ error: "Missing web3AuthSub" }, { status: 400 });
+  const walletAddress = req.nextUrl.searchParams.get("walletAddress");
+  if (!walletAddress || !isAddress(walletAddress)) {
+    return NextResponse.json({ error: "Missing or invalid walletAddress" }, { status: 400 });
+  }
 
   await connectDB();
-  const user = await User.findOne({ web3AuthSub });
+  const user = await User.findOne({ walletAddress });
   if (!user) return NextResponse.json({ profile: DEFAULT_RISK_PROFILE, isDefault: true });
 
   const profile = await RiskProfile.findOne({ userId: user._id });
@@ -17,8 +20,10 @@ export async function GET(req: NextRequest) {
 
 export async function PUT(req: NextRequest) {
   const body = await req.json();
-  const { web3AuthSub, profile, estimatedGasBps } = body ?? {};
-  if (!web3AuthSub || !profile) return NextResponse.json({ error: "web3AuthSub and profile are required" }, { status: 400 });
+  const { walletAddress, profile, estimatedGasBps } = body ?? {};
+  if (!walletAddress || !isAddress(walletAddress) || !profile) {
+    return NextResponse.json({ error: "walletAddress and profile are required" }, { status: 400 });
+  }
 
   const review = reviewProposedProfile(profile, estimatedGasBps ?? 2);
   if (!review.accepted && !body.acknowledgeWarnings) {
@@ -27,7 +32,7 @@ export async function PUT(req: NextRequest) {
   }
 
   await connectDB();
-  const user = await User.findOne({ web3AuthSub });
+  const user = await User.findOne({ walletAddress });
   if (!user) return NextResponse.json({ error: "User not found — create a vault first" }, { status: 404 });
 
   const finalProfile = { ...profile, ...(review.adjusted ?? {}) };
