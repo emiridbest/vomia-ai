@@ -17,7 +17,7 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: 15, // 0.15% net edge required before the scanner will even quote a trade
+  minProfitBps: 5, // 0.05% net edge — still comfortably above the ~0bps gas floor on Celo, tuned for trade frequency over margin
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
   enabledStrategies: ["rebalance"],

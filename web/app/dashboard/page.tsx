@@ -2,14 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { parseUnits } from "viem";
-import { useWaitForTransactionReceipt, useWriteContract, usePublicClient } from "wagmi";
+import { encodeFunctionData, parseUnits } from "viem";
+import { useSendTransaction, useWaitForTransactionReceipt, useWriteContract, usePublicClient } from "wagmi";
 import ConnectWalletButton from "../components/ConnectWalletButton";
 import { useVomiaIdentity } from "../hooks/useVomiaIdentity";
 import { activeChain } from "../../lib/chains";
 import { DEFAULT_STRATEGY_TOKENS, TOKENS, tokenAddress, type TokenSymbol } from "../../lib/tokens";
 import { MENTO_BROKER_ADDRESS } from "../../lib/dex/mento";
 import { UNISWAP_SWAP_ROUTER_02 } from "../../lib/dex/uniswap";
+import { attachAttributionTag } from "../../lib/attribution";
 
 interface TradeRow {
   time: string;
@@ -118,12 +119,13 @@ export default function Dashboard() {
 
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [feedNote, setFeedNote] = useState<string | null>(null);
-  const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 15, maxSlippageBps: 100, maxTradesPerDay: 50 });
+  const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 50 });
   const [warnings, setWarnings] = useState<string[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "review" | "saved">("idle");
   const [profileError, setProfileError] = useState<string | null>(null);
 
   const { writeContractAsync, isPending: submittingVaultTx } = useWriteContract();
+  const { sendTransactionAsync } = useSendTransaction();
   const { isSuccess: vaultTxConfirmed } = useWaitForTransactionReceipt({ hash: pendingTxHash });
 
   const checkVault = useCallback(async () => {
@@ -254,11 +256,17 @@ export default function Dashboard() {
     }
     setDepositStatus("Confirm in your wallet…");
     try {
-      const hash = await writeContractAsync({
-        address: tokenAddress(depositToken, chain.id),
+      // Sent as a raw tagged transaction (not useWriteContract) so the
+      // ERC-8021 attribution suffix can ride along on the deposit itself,
+      // same as every trade the worker executes.
+      const transferData = encodeFunctionData({
         abi: ERC20_TRANSFER_ABI,
         functionName: "transfer",
         args: [vaultAddress, amountWei],
+      });
+      const hash = await sendTransactionAsync({
+        to: tokenAddress(depositToken, chain.id),
+        data: attachAttributionTag(transferData),
       });
       setDepositStatus("Confirming on-chain…");
       await publicClient.waitForTransactionReceipt({ hash });
