@@ -1,0 +1,41 @@
+{
+  "name": "vomia-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "worker": "tsx scripts/worker.ts"
+  },
+  "dependencies": {
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ai": "^3.3.0",
+    "@ai-sdk/openai": "^0.0.36",
+    "@goat-sdk/adapter-vercel-ai": "^0.1.9",
+    "@goat-sdk/wallet-viem": "^0.1.5",
+    "@goat-sdk/core": "^0.3.9",
+    "viem": "^2.19.0",
+    "wagmi": "^2.12.0",
+    "@web3auth/modal": "^9.4.3",
+    "@0xsquid/sdk": "^2.8.0-beta.0",
+    "@lifi/sdk": "^3.4.1",
+    "mongoose": "^8.5.1",
+    "@celo/attribution-tags": "^0.2.0",
+    "react-markdown": "^9.0.1",
+    "uuid": "^9.0.1",
+    "lucide-react": "^0.400.0",
+    "zod": "^3.23.8",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/uuid": "^9.0.8",
+    "tsx": "^4.16.2"
+  }
+}
