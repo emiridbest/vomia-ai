@@ -17,7 +17,7 @@
  *     (for slippage protection) and still won't execute with no route.
  */
 import { v4 as uuidv4 } from "uuid";
-import { keccak256, toBytes, type Address } from "viem";
+import { encodeFunctionData, keccak256, toBytes, type Address } from "viem";
 import { getOperatorWalletClient } from "../vault/operatorSigner";
 import {
   buildMentoSwapCalldata,
@@ -78,23 +78,35 @@ async function sendTaggedSwap(params: {
   reasonOnSuccess: string;
 }): Promise<ExecutionResult> {
   const actionId = keccak256(toBytes(uuidv4()));
-  const taggedCallData = attachAttributionTag(params.callData);
   const walletClient = getOperatorWalletClient();
 
+  // The tag has to ride on THIS (outer) transaction's own calldata, not on
+  // params.callData — that's the inner router call, passed as a `bytes`
+  // argument to executeSwap, so a tag appended there ends up ABI-padded
+  // mid-calldata rather than at the true tail any real indexer checks
+  // (confirmed: the official package's own verifyTx() couldn't find a tag
+  // placed that way). Encode the untagged call fully first, tag the
+  // result, then send as a raw transaction — writeContract does its own
+  // encoding internally and won't let us append bytes after it.
+  const untaggedData = encodeFunctionData({
+    abi: AGENT_VAULT_EXECUTE_ABI,
+    functionName: "executeSwap",
+    args: [
+      actionId,
+      TOKENS[params.tokenIn].address,
+      TOKENS[params.tokenOut].address,
+      params.amountIn,
+      params.minAmountOut,
+      params.target,
+      params.callData,
+    ],
+  });
+  const taggedData = await attachAttributionTag(untaggedData);
+
   try {
-    const txHash = await walletClient.writeContract({
-      address: params.vaultAddress,
-      abi: AGENT_VAULT_EXECUTE_ABI,
-      functionName: "executeSwap",
-      args: [
-        actionId,
-        TOKENS[params.tokenIn].address,
-        TOKENS[params.tokenOut].address,
-        params.amountIn,
-        params.minAmountOut,
-        params.target,
-        taggedCallData,
-      ],
+    const txHash = await walletClient.sendTransaction({
+      to: params.vaultAddress,
+      data: taggedData,
       chain: walletClient.chain,
       account: walletClient.account!,
     });

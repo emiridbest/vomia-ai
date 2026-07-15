@@ -303,9 +303,10 @@ export default function Dashboard() {
         functionName: "transfer",
         args: [vaultAddress, amountWei],
       });
+      const taggedData = await attachAttributionTag(transferData);
       const hash = await sendTransactionAsync({
         to: tokenAddress(depositToken, chain.id),
-        data: attachAttributionTag(transferData),
+        data: taggedData,
       });
       setDepositStatus("Confirming on-chain…");
       await publicClient.waitForTransactionReceipt({ hash });
