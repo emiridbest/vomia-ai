@@ -193,6 +193,11 @@ async function runRebalance(user: any, profile: any) {
         { tokenIn: "USDm", tokenOut: "KESm" },
         { tokenIn: "USDm", tokenOut: "NGNm" },
         { tokenIn: "USDm", tokenOut: "EURm" },
+        // Tightest Mento spread of the lot (typically ~-36bps vs the
+        // oracle mid, against ~-350bps on the regional pairs), so it's the
+        // pair most likely to genuinely clear the profit floor when the
+        // pool price dislocates above oracle fair value.
+        { tokenIn: "USDm", tokenOut: "CELO" },
       ];
 
   for (const pair of pairs) {
