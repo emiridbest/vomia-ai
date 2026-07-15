@@ -59,7 +59,44 @@ const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated bala
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
 const VAULT_BALANCE_ABI = [
   { type: "function", name: "tokenBalance", stateMutability: "view", inputs: [{ name: "token", type: "address" }], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "owner", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
 ] as const;
+
+const FACTORY_ADDRESS = process.env.NEXT_PUBLIC_VAULT_FACTORY_ADDRESS as Address | undefined;
+const FACTORY_ABI = [
+  { type: "function", name: "vaultCount", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "allVaults", stateMutability: "view", inputs: [{ name: "", type: "uint256" }], outputs: [{ type: "address" }] },
+] as const;
+
+/**
+ * Enumerates every vault the factory has ever created (vaultCount/allVaults
+ * — cheap contract reads, no event-log block-range scanning needed) and
+ * upserts a User record for any vault whose owner isn't already in the DB,
+ * or whose DB record points at the wrong vault. This makes the DB sync
+ * independent of the frontend's best-effort POST /api/vault call, which has
+ * no delivery guarantee at all — a closed tab, a network blip, or a silent
+ * failure there previously left a real, funded vault permanently invisible
+ * to the worker until someone noticed and fixed it by hand (twice, in
+ * testing). Runs every tick; fine at hackathon scale (a full rescan is a
+ * couple of cheap reads per vault), would want an incremental/cached
+ * approach if this ever needs to handle thousands of vaults.
+ */
+async function reconcileVaultsFromChain() {
+  if (!FACTORY_ADDRESS) return;
+  const count = await publicClient.readContract({ address: FACTORY_ADDRESS, abi: FACTORY_ABI, functionName: "vaultCount" });
+  for (let i = 0n; i < count; i++) {
+    const vaultAddress = await publicClient.readContract({ address: FACTORY_ADDRESS, abi: FACTORY_ABI, functionName: "allVaults", args: [i] });
+    const owner = await publicClient.readContract({ address: vaultAddress, abi: VAULT_BALANCE_ABI, functionName: "owner" });
+    const existing = await User.findOne({ walletAddress: owner });
+    if (!existing) {
+      await User.create({ walletAddress: owner, vaultAddress });
+      console.log(`Reconciled a vault the DB didn't know about: ${owner.slice(0, 8)} -> ${vaultAddress}`);
+    } else if (existing.vaultAddress?.toLowerCase() !== vaultAddress.toLowerCase()) {
+      await User.updateOne({ _id: existing._id }, { vaultAddress });
+      console.log(`Corrected a stale vault mapping for ${owner.slice(0, 8)}`);
+    }
+  }
+}
 
 let ticking = false;
 
@@ -178,6 +215,7 @@ async function tick() {
 
   try {
     await connectDB();
+    await reconcileVaultsFromChain();
     const users = await User.find({ vaultAddress: { $exists: true, $ne: null } });
     console.log(`Found ${users.length} user(s) with a vault.`);
 
@@ -216,6 +254,20 @@ async function tick() {
   }
 }
 
-console.log(`Vomia worker starting. Heartbeat: ${HEARTBEAT_SECONDS}s, scan size: ${SCAN_AMOUNT_HUMAN} units.`);
-tick();
-setInterval(tick, HEARTBEAT_SECONDS * 1000);
+async function start() {
+  console.log(`Vomia worker starting. Heartbeat: ${HEARTBEAT_SECONDS}s, scan size: ${SCAN_AMOUNT_HUMAN} units.`);
+  // Mongoose doesn't alter existing indexes on a live collection just
+  // because the schema changed — a stale unique index on the old
+  // web3AuthSub field (since made optional) was still rejecting any second
+  // user record without one. Sync once at startup so the live indexes
+  // always match the current schema, instead of needing a one-off manual
+  // fix every time a schema constraint changes.
+  await connectDB();
+  await User.syncIndexes();
+  await RiskProfile.syncIndexes();
+  await TradeLog.syncIndexes();
+  tick();
+  setInterval(tick, HEARTBEAT_SECONDS * 1000);
+}
+
+start();
