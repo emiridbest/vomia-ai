@@ -1,19 +1,22 @@
 /**
  * The Vomia worker — the always-on heartbeat (run with `npm run worker`).
  *
- * Every HEARTBEAT_SECONDS it: loads all users with an unpaused risk
- * profile, scans each of their allowed token pairs across venues, and for
- * any scan that clears the user's own profit margin, executes through
- * their vault (which re-enforces every cap on-chain regardless of what
- * this code does).
+ * Every HEARTBEAT_SECONDS it loads all users with an unpaused risk profile
+ * and runs whichever strategies they've enabled:
  *
- * Honest capacity math for the "1000 trades/day" target: at a 60s
- * heartbeat this loop *checks* each pair ~1,440 times a day, so the
- * pipeline can execute 1000+/day *if the market offers that many
- * above-margin opportunities*. It will not manufacture trades to hit a
- * number — every skipped tick is logged with its reason, which is itself
- * useful demo material ("the agent declined 1,395 times today and here's
- * why" is a better judging story than 1,000 forced losses).
+ *   - rebalance: scans each allowed token pair across venues, and for any
+ *     scan that clears the user's own profit margin, executes through
+ *     their vault. Never manufactures a trade to hit a volume number —
+ *     every skipped tick is logged with its reason.
+ *   - dca: buys a fixed amount into CELO and G$ from USDm on a fixed
+ *     schedule (DCA_INTERVAL_MS), independent of price — that's the
+ *     definition of dollar-cost-averaging. It rides this same heartbeat
+ *     rather than running its own timer: each tick just checks, per user
+ *     and per DCA pair, whether enough time has passed since the last DCA
+ *     trade (via TradeLog), and only then executes.
+ *
+ * Either way, the vault contract re-enforces every cap on-chain regardless
+ * of what this code sends.
  *
  * Run this as a single separate process (Railway/Fly/a VPS), NOT inside
  * the Next.js serverless app — serverless instances can overlap, and two
@@ -24,14 +27,67 @@
 import { connectDB } from "../lib/db/connection";
 import { User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
-import { executeIfProfitable } from "../lib/strategy/executor";
+import { executeIfProfitable, executeDca } from "../lib/strategy/executor";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
 
+const DCA_AMOUNT_HUMAN = 1; // fixed USDm spend per DCA buy, per the product spec
+const DCA_INTERVAL_MS = 30 * 60 * 1000;
+const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
+  { tokenIn: "USDm", tokenOut: "CELO" },
+  { tokenIn: "USDm", tokenOut: "GOOD_DOLLAR" },
+];
+
 let ticking = false;
+
+async function runRebalance(user: any, profile: any) {
+  const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = profile.allowedTokenPairs?.length
+    ? profile.allowedTokenPairs
+    : [
+        { tokenIn: "USDm", tokenOut: "KESm" },
+        { tokenIn: "USDm", tokenOut: "NGNm" },
+        { tokenIn: "USDm", tokenOut: "EURm" },
+      ];
+
+  for (const pair of pairs) {
+    const decimalsIn = TOKENS[pair.tokenIn].decimals;
+    const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
+
+    const scan = await scanPair(pair.tokenIn, pair.tokenOut, amountIn, SCAN_AMOUNT_HUMAN, profile);
+
+    if (scan.decision === "execute") {
+      const result = await executeIfProfitable(user.vaultAddress, user._id.toString(), scan, profile.maxSlippageBps);
+      console.log(
+        `[${user.walletAddress.slice(0, 8)}] rebalance ${pair.tokenIn}->${pair.tokenOut}: ${result.status}` +
+          (result.txHash ? ` tx=${result.txHash}` : "") +
+          ` (${result.reason})`
+      );
+    } else {
+      // Log skips too — this is the honest live-feed material.
+      console.log(`[${user.walletAddress.slice(0, 8)}] rebalance ${pair.tokenIn}->${pair.tokenOut}: ${scan.decision} (${scan.reason})`);
+    }
+  }
+}
+
+async function runDca(user: any, profile: any) {
+  for (const pair of DCA_PAIRS) {
+    const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenOut: pair.tokenOut }).sort({ createdAt: -1 });
+    if (lastRun && Date.now() - lastRun.createdAt.getTime() < DCA_INTERVAL_MS) continue;
+
+    const decimalsIn = TOKENS[pair.tokenIn].decimals;
+    const amountIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 10 ** decimalsIn));
+
+    const result = await executeDca(user.vaultAddress, user._id.toString(), pair.tokenIn, pair.tokenOut, amountIn, profile.maxSlippageBps);
+    console.log(
+      `[${user.walletAddress.slice(0, 8)}] dca ${pair.tokenIn}->${pair.tokenOut}: ${result.status}` +
+        (result.txHash ? ` tx=${result.txHash}` : "") +
+        ` (${result.reason})`
+    );
+  }
+}
 
 async function tick() {
   if (ticking) return; // never let a slow tick overlap the next one
@@ -41,53 +97,34 @@ async function tick() {
   try {
     await connectDB();
     const users = await User.find({ vaultAddress: { $exists: true, $ne: null } });
+    console.log(`Found ${users.length} user(s) with a vault.`);
 
     for (const user of users) {
       const profile = (await RiskProfile.findOne({ userId: user._id })) ?? DEFAULT_RISK_PROFILE;
-      if ((profile as any).paused) continue;
+      if ((profile as any).paused) {
+        console.log(`[${user.walletAddress.slice(0, 8)}] skipped: risk profile is paused.`);
+        continue;
+      }
+
+      const strategies: string[] = profile.enabledStrategies?.length ? profile.enabledStrategies : DEFAULT_RISK_PROFILE.enabledStrategies;
 
       // Self-enforced daily trade budget (the vault separately enforces
-      // token-unit caps on-chain; this one is about count).
+      // token-unit caps on-chain; this one is about count), shared across
+      // whichever strategies this user has enabled.
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
       const tradesToday = await TradeLog.countDocuments({
         userId: user._id,
         status: { $in: ["submitted", "settled"] },
         createdAt: { $gte: since },
       });
-      if (tradesToday >= profile.maxTradesPerDay) continue;
-
-      const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] =
-        (profile as any).allowedTokenPairs?.length
-          ? (profile as any).allowedTokenPairs
-          : [
-              { tokenIn: "USDm", tokenOut: "KESm" },
-              { tokenIn: "USDm", tokenOut: "NGNm" },
-              { tokenIn: "USDm", tokenOut: "EURm" },
-            ];
-
-      for (const pair of pairs) {
-        const decimalsIn = TOKENS[pair.tokenIn].decimals;
-        const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
-
-        const scan = await scanPair(pair.tokenIn, pair.tokenOut, amountIn, SCAN_AMOUNT_HUMAN, profile);
-
-        if (scan.decision === "execute") {
-          const result = await executeIfProfitable(
-            user.vaultAddress as `0x${string}`,
-            user._id.toString(),
-            scan,
-            profile.maxSlippageBps
-          );
-          console.log(
-            `[${user.walletAddress.slice(0, 8)}] ${pair.tokenIn}->${pair.tokenOut}: ${result.status}` +
-              (result.txHash ? ` tx=${result.txHash}` : "") +
-              ` (${result.reason})`
-          );
-        } else {
-          // Log skips too — this is the honest live-feed material.
-          console.log(`[${user.walletAddress.slice(0, 8)}] ${pair.tokenIn}->${pair.tokenOut}: ${scan.decision} (${scan.reason})`);
-        }
+      if (tradesToday >= profile.maxTradesPerDay) {
+        console.log(`[${user.walletAddress.slice(0, 8)}] skipped: hit daily trade cap (${tradesToday}/${profile.maxTradesPerDay}).`);
+        continue;
       }
+
+      console.log(`[${user.walletAddress.slice(0, 8)}] strategies: ${strategies.join(", ")}`);
+      if (strategies.includes("rebalance")) await runRebalance(user, profile);
+      if (strategies.includes("dca")) await runDca(user, profile);
     }
   } catch (err) {
     console.error("Worker tick failed:", err instanceof Error ? err.message : err);

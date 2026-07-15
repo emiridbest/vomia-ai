@@ -120,6 +120,7 @@ export default function Dashboard() {
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [feedNote, setFeedNote] = useState<string | null>(null);
   const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 50 });
+  const [strategy, setStrategy] = useState<"rebalance" | "dca">("rebalance");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "review" | "saved">("idle");
   const [profileError, setProfileError] = useState<string | null>(null);
@@ -164,6 +165,25 @@ export default function Dashboard() {
       body: JSON.stringify({ web3AuthSub: web3AuthSub ?? undefined, walletAddress: address, vaultAddress }),
     });
   }, [vaultAddress, address, web3AuthSub]);
+
+  // Load whatever risk profile (including strategy choice) is already
+  // saved, so the form reflects reality instead of always resetting to
+  // defaults on every page load.
+  useEffect(() => {
+    if (!address) return;
+    fetch(`/api/risk-profile?walletAddress=${address}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.isDefault || !data.profile) return;
+        setProfile({
+          minProfitBps: data.profile.minProfitBps,
+          maxSlippageBps: data.profile.maxSlippageBps,
+          maxTradesPerDay: data.profile.maxTradesPerDay,
+        });
+        if (data.profile.enabledStrategies?.includes("dca")) setStrategy("dca");
+      })
+      .catch(() => {});
+  }, [address]);
 
   // Once the createVault transaction confirms, look the vault up on-chain
   // (via the same GET this page already uses). The DB-sync effect above
@@ -362,7 +382,10 @@ export default function Dashboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         walletAddress: address,
-        profile: { ...profile, enabledStrategies: ["rebalance"] },
+        // Saving a profile is the user's opt-in signal — RiskProfile.paused
+        // defaults to true for anyone who's never configured anything, but
+        // actively saving one here means they want the worker to run.
+        profile: { ...profile, enabledStrategies: [strategy], paused: false },
         acknowledgeWarnings: acknowledge,
       }),
     });
@@ -530,6 +553,13 @@ export default function Dashboard() {
 
             {isConnected && vaultAddress && (
               <>
+                <div className="field-row">
+                  <label htmlFor="strategy">Strategy</label>
+                  <select id="strategy" value={strategy} onChange={(e) => setStrategy(e.target.value as "rebalance" | "dca")}>
+                    <option value="rebalance">Rebalance — trade only when it clears your profit margin</option>
+                    <option value="dca">DCA — buy 1 USDm worth of CELO + G$ every 30 minutes, regardless of price</option>
+                  </select>
+                </div>
                 <div className="field-row">
                   <label htmlFor="minProfit">Min profit (bps)</label>
                   <input id="minProfit" type="number" value={profile.minProfitBps}
