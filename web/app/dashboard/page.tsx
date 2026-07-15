@@ -165,14 +165,25 @@ export default function Dashboard() {
   // upsert keyed by walletAddress, so calling it again is harmless.
   // web3AuthSub is attached when available but never required — its own
   // fetch can hang or fail without blocking anything here.
-  useEffect(() => {
-    if (!vaultAddress || !address) return;
-    fetch("/api/vault", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ web3AuthSub: web3AuthSub ?? undefined, walletAddress: address, vaultAddress }),
-    });
+  const syncVaultToDb = useCallback(async () => {
+    if (!vaultAddress || !address) return false;
+    try {
+      const res = await fetch("/api/vault", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ web3AuthSub: web3AuthSub ?? undefined, walletAddress: address, vaultAddress }),
+      });
+      if (!res.ok) console.error("Vault DB sync failed:", res.status, await res.text().catch(() => ""));
+      return res.ok;
+    } catch (err) {
+      console.error("Vault DB sync failed:", err);
+      return false;
+    }
   }, [vaultAddress, address, web3AuthSub]);
+
+  useEffect(() => {
+    syncVaultToDb();
+  }, [syncVaultToDb]);
 
   // Load whatever risk profile (including strategy choice) is already
   // saved, so the form reflects reality instead of always resetting to
@@ -385,10 +396,8 @@ export default function Dashboard() {
     setActivationStatus(`Activated ✓ — ${capsSummary}. Adjust anytime.`);
   }
 
-  async function submitProfile(acknowledge: boolean) {
-    if (!address) return;
-    setProfileError(null);
-    const res = await fetch("/api/risk-profile", {
+  async function putProfile(acknowledge: boolean) {
+    return fetch("/api/risk-profile", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -400,6 +409,21 @@ export default function Dashboard() {
         acknowledgeWarnings: acknowledge,
       }),
     });
+  }
+
+  async function submitProfile(acknowledge: boolean) {
+    if (!address) return;
+    setProfileError(null);
+    let res = await putProfile(acknowledge);
+
+    // Self-heal: "User not found" here means the vault->DB sync effect
+    // hasn't landed yet (a timing race on a fresh wallet) or silently
+    // failed. Re-sync explicitly and retry once before surfacing an error.
+    if (res.status === 404) {
+      const synced = await syncVaultToDb();
+      if (synced) res = await putProfile(acknowledge);
+    }
+
     const data = await res.json();
     if (!res.ok || data.error) {
       setProfileError(data.error || `Save failed (${res.status})`);
