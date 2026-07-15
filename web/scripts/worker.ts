@@ -5,7 +5,8 @@
  * and runs whichever strategies they've enabled:
  *
  *   - rebalance: scans each allowed token pair across venues, and for any
- *     scan that clears the user's own profit margin, executes through
+ *     scan that clears the user's own profit margin (against Mento's own
+ *     oracle reference rate — see lib/dex/oracle.ts), executes through
  *     their vault. Never manufactures a trade to hit a volume number —
  *     every skipped tick is logged with its reason.
  *   - dca: buys a fixed amount into CELO and G$ from USDm on a fixed
@@ -14,6 +15,14 @@
  *     rather than running its own timer: each tick just checks, per user
  *     and per DCA pair, whether enough time has passed since the last DCA
  *     trade (via TradeLog), and only then executes.
+ *
+ * Both strategies are one-directional by default (USDm spent, never
+ * replenished), which would eventually exhaust the vault's USDm balance.
+ * cycleBackIfDue() catches this: after REBALANCE_CYCLE_LIMIT forward trades
+ * into a currency (rebalance) or DCA_CYCLE_LIMIT forward buys (dca), it
+ * swaps the entire accumulated balance of that token back to USDm instead
+ * of doing another forward trade. This also gives a natural checkpoint to
+ * see whether a cycle actually netted more or less USDm than was spent.
  *
  * Either way, the vault contract re-enforces every cap on-chain regardless
  * of what this code sends.
@@ -24,12 +33,15 @@
  * idempotency exists to catch, but there's no reason to lean on the last
  * line of defense by design.
  */
+import { createPublicClient, http, type Address } from "viem";
+import { celo } from "viem/chains";
 import { connectDB } from "../lib/db/connection";
 import { User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
 import { executeIfProfitable, executeDca } from "../lib/strategy/executor";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
+import { rpcUrl } from "../lib/chains";
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
@@ -41,7 +53,69 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
   { tokenIn: "USDm", tokenOut: "GOOD_DOLLAR" },
 ];
 
+const REBALANCE_CYCLE_LIMIT = 3; // forward trades into a currency before swapping the balance back
+const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated balance back
+
+const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
+const VAULT_BALANCE_ABI = [
+  { type: "function", name: "tokenBalance", stateMutability: "view", inputs: [{ name: "token", type: "address" }], outputs: [{ type: "uint256" }] },
+] as const;
+
 let ticking = false;
+
+/** How many tokenIn->tokenOut trades have settled since the most recent tokenOut->tokenIn (reverse) trade. */
+async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol, tokenOut: TokenSymbol): Promise<number> {
+  const lastReverse = await TradeLog.findOne({
+    userId,
+    tokenIn: tokenOut,
+    tokenOut: tokenIn,
+    status: { $in: ["submitted", "settled"] },
+  }).sort({ createdAt: -1 });
+  const since = lastReverse ? lastReverse.createdAt : new Date(0);
+  return TradeLog.countDocuments({
+    userId,
+    tokenIn,
+    tokenOut,
+    status: { $in: ["submitted", "settled"] },
+    createdAt: { $gt: since },
+  });
+}
+
+/**
+ * If this user has hit the cycle limit for tokenIn->tokenOut, swaps the
+ * vault's entire current tokenOut balance back to tokenIn (unconditional,
+ * same as DCA — this is housekeeping to prevent exhaustion, not a
+ * profit-gated trade) and returns true so the caller skips its normal
+ * forward-trade logic for this pair this tick. Returns false if not due,
+ * or if there's nothing to cycle back.
+ */
+async function cycleBackIfDue(
+  user: any,
+  tokenIn: TokenSymbol,
+  tokenOut: TokenSymbol,
+  cycleLimit: number,
+  strategy: "rebalance" | "dca",
+  maxSlippageBps: number
+): Promise<boolean> {
+  const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
+  if (forwardCount < cycleLimit) return false;
+
+  const balance = await publicClient.readContract({
+    address: user.vaultAddress as Address,
+    abi: VAULT_BALANCE_ABI,
+    functionName: "tokenBalance",
+    args: [TOKENS[tokenOut].address],
+  });
+  if (balance === 0n) return false;
+
+  const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, balance, maxSlippageBps, strategy);
+  console.log(
+    `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn} (after ${forwardCount} buys): ${result.status}` +
+      (result.txHash ? ` tx=${result.txHash}` : "") +
+      ` (${result.reason})`
+  );
+  return true;
+}
 
 async function runRebalance(user: any, profile: any) {
   const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = profile.allowedTokenPairs?.length
@@ -53,6 +127,9 @@ async function runRebalance(user: any, profile: any) {
       ];
 
   for (const pair of pairs) {
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, REBALANCE_CYCLE_LIMIT, "rebalance", profile.maxSlippageBps);
+    if (cycled) continue;
+
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
 
@@ -74,7 +151,12 @@ async function runRebalance(user: any, profile: any) {
 
 async function runDca(user: any, profile: any) {
   for (const pair of DCA_PAIRS) {
-    const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenOut: pair.tokenOut }).sort({ createdAt: -1 });
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, DCA_CYCLE_LIMIT, "dca", profile.maxSlippageBps);
+    if (cycled) continue;
+
+    const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenIn: pair.tokenIn, tokenOut: pair.tokenOut }).sort({
+      createdAt: -1,
+    });
     if (lastRun && Date.now() - lastRun.createdAt.getTime() < DCA_INTERVAL_MS) continue;
 
     const decimalsIn = TOKENS[pair.tokenIn].decimals;

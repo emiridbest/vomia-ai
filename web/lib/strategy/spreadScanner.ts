@@ -14,7 +14,8 @@
  */
 import { getMentoQuote } from "../dex/mento";
 import { getUniswapQuote } from "../dex/uniswap";
-import { TOKENS, type TokenSymbol } from "../tokens";
+import { getReferenceAmountOut } from "../dex/oracle";
+import { type TokenSymbol } from "../tokens";
 import { netEdgeBps, type RiskProfile } from "./riskProfile";
 
 export interface VenueQuote {
@@ -78,14 +79,54 @@ export async function scanPair(
 
   const bestVenue = quotes.reduce((best, q) => (q.amountOut > best.amountOut ? q : best));
 
-  // "Edge" here is measured against the naive 1:1-of-value expectation
-  // encoded in amountInUsdEstimate — a proper implementation should compare
-  // against a reference price feed (e.g. Mento's own SortedOracles) rather
-  // than assuming amountIn's USD value; wire that in before trusting this
-  // with real arbitrage decisions rather than simple rebalancing.
-  const outDecimals = TOKENS[tokenOut].decimals;
-  const outAsFloat = Number(bestVenue.amountOut) / 10 ** outDecimals;
-  const impliedEdgeBps = Math.round(((outAsFloat - amountInUsdEstimate) / amountInUsdEstimate) * 10000);
+  // Edge is measured against Mento's own SortedOracles reference rate — an
+  // independent price, not the naive "amountIn is worth $1 per unit"
+  // assumption this used to make (which silently broke for every pair
+  // where tokenOut isn't ~1 USD: KESm/NGNm looked absurdly "profitable",
+  // EURm looked like a loss, regardless of actual market conditions). If no
+  // reference rate is available for this pair (not a Mento stable on either
+  // side), we can't verify profitability at all, so we don't guess — skip.
+  const referenceAmountOut = await getReferenceAmountOut(tokenIn, tokenOut, amountIn);
+  if (referenceAmountOut === null || referenceAmountOut === 0n) {
+    return {
+      tokenIn,
+      tokenOut,
+      amountIn,
+      quotes,
+      bestVenue,
+      netEdgeBps: null,
+      decision: "skip-no-route",
+      reason: "No independent reference rate available for this pair — can't verify profitability, so not executing blind.",
+    };
+  }
+
+  // Sanity guard: not every Mento stable's rateFeedID is simply its own
+  // token address (Chainlink-relayed feeds use a different identifier
+  // scheme per Mento's docs, unverified here) — if the wrong feed gets
+  // queried, medianRate can still return a *number*, just a meaningless
+  // one, off by orders of magnitude from anything real. A genuine DEX-vs-
+  // oracle discrepancy on a liquid stable pair should be small; if the
+  // reference disagrees with the DEX's own quote by more than 10x in
+  // either direction, that's a sign the reference itself is unreliable,
+  // not a real 1000%+ edge. Refuse to trade on it rather than risk acting
+  // on a wrong-by-orders-of-magnitude number.
+  const ratio = Number(bestVenue.amountOut) / Number(referenceAmountOut);
+  if (ratio > 10 || ratio < 0.1) {
+    return {
+      tokenIn,
+      tokenOut,
+      amountIn,
+      quotes,
+      bestVenue,
+      netEdgeBps: null,
+      decision: "skip-no-route",
+      reason: `Oracle reference for ${tokenIn}->${tokenOut} disagrees with the DEX quote by an implausible margin (ratio ${ratio.toFixed(2)}) — likely the wrong rate feed ID for this token, not a real edge. Refusing to trade on it.`,
+    };
+  }
+
+  // Pure BigInt through the comparison so this never risks precision loss
+  // converting large raw token amounts to a JS Number.
+  const impliedEdgeBps = Number(((bestVenue.amountOut - referenceAmountOut) * 10000n) / referenceAmountOut);
 
   const gasBps = estimateGasBps(amountInUsdEstimate);
   const edge = netEdgeBps(impliedEdgeBps, 0, gasBps);
@@ -99,7 +140,7 @@ export async function scanPair(
       bestVenue,
       netEdgeBps: edge,
       decision: "skip-below-margin",
-      reason: `Net edge ${edge}bps is below the configured minimum of ${riskProfile.minProfitBps}bps.`,
+      reason: `Net edge ${edge}bps (vs. oracle reference rate) is below the configured minimum of ${riskProfile.minProfitBps}bps.`,
     };
   }
 
@@ -111,6 +152,6 @@ export async function scanPair(
     bestVenue,
     netEdgeBps: edge,
     decision: "execute",
-    reason: `Best venue (${bestVenue.venue}) clears the ${riskProfile.minProfitBps}bps margin with ${edge}bps net.`,
+    reason: `Best venue (${bestVenue.venue}) clears the ${riskProfile.minProfitBps}bps margin with ${edge}bps net (vs. oracle reference rate).`,
   };
 }

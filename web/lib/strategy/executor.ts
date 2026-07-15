@@ -201,10 +201,15 @@ export async function executeIfProfitable(
 }
 
 /**
- * DCA: buy tokenOut with a fixed amountIn of tokenIn, unconditionally — no
- * profit check, that's the point of dollar-cost-averaging. Still requires a
- * real quote from at least one venue (for slippage protection) and still
- * won't execute if nothing has a route (e.g. no Uniswap pool for this pair).
+ * Executes a swap unconditionally — no profit check. Used by two callers
+ * with different intents but identical safety requirements:
+ *   - the worker's DCA loop (strategy: "dca"), which buys on a fixed
+ *     schedule by definition, regardless of price
+ *   - the chat agent's on-demand swap tool (strategy: "rebalance"), for
+ *     when a user explicitly asks to convert tokens inside their vault
+ *     right now
+ * Either way this still requires a real quote from at least one venue (for
+ * slippage protection) and still won't execute if nothing has a route.
  */
 export async function executeDca(
   vaultAddress: Address,
@@ -212,7 +217,8 @@ export async function executeDca(
   tokenIn: TokenSymbol,
   tokenOut: TokenSymbol,
   amountIn: bigint,
-  maxSlippageBps: number
+  maxSlippageBps: number,
+  strategy: "dca" | "rebalance" = "dca"
 ): Promise<ExecutionResult> {
   const [mento, uniswapOut] = await Promise.all([
     getMentoQuote(tokenIn, tokenOut, amountIn).catch(() => null),
@@ -229,7 +235,7 @@ export async function executeDca(
       userId,
       vaultAddress,
       actionId,
-      strategy: "dca",
+      strategy,
       tokenIn,
       tokenOut,
       amountIn: amountIn.toString(),
@@ -277,7 +283,7 @@ export async function executeDca(
   return sendTaggedSwap({
     vaultAddress,
     userId,
-    strategy: "dca",
+    strategy,
     tokenIn,
     tokenOut,
     amountIn,
@@ -285,6 +291,7 @@ export async function executeDca(
     target,
     callData,
     amountOut: bestVenue.amountOut,
-    reasonOnSuccess: `DCA buy: ${tokenIn} -> ${tokenOut} via ${bestVenue.venue}`,
+    reasonOnSuccess:
+      strategy === "dca" ? `DCA buy: ${tokenIn} -> ${tokenOut} via ${bestVenue.venue}` : `On-demand swap: ${tokenIn} -> ${tokenOut} via ${bestVenue.venue}`,
   });
 }

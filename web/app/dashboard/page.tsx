@@ -481,7 +481,7 @@ export default function Dashboard() {
               <h4 style={{ marginTop: 16, fontSize: "0.85rem" }}>Balances</h4>
               <ul style={{ fontSize: "0.85rem", color: "var(--cream-dim)", marginTop: 4 }}>
                 {ACTIVATION_TOKENS.map((symbol) => (
-                  <li key={symbol}>{symbol}: {balances[symbol] ?? "…"}</li>
+                  <li key={symbol}>{symbol === "GOOD_DOLLAR" ? "G$" : symbol}: {balances[symbol] ?? "…"}</li>
                 ))}
               </ul>
 
@@ -492,7 +492,7 @@ export default function Dashboard() {
               <div className="field-row">
                 <select value={depositToken} onChange={(e) => setDepositToken(e.target.value as TokenSymbol)}>
                   {ACTIVATION_TOKENS.map((symbol) => (
-                    <option key={symbol} value={symbol}>{symbol}</option>
+                    <option key={symbol} value={symbol}>{symbol === "GOOD_DOLLAR" ? "G$ (GoodDollar)" : symbol}</option>
                   ))}
                 </select>
                 <input

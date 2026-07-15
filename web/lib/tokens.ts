@@ -127,7 +127,7 @@ export const TOKENS: Record<TokenSymbol, TokenInfo> = {
  * feed the scanner has to poll and another pair the vault owner has to
  * explicitly allow-list and cap.
  */
-export const DEFAULT_STRATEGY_TOKENS: TokenSymbol[] = ["USDm", "KESm", "NGNm", "EURm", "USDC", "USDT", "CELO"];
+export const DEFAULT_STRATEGY_TOKENS: TokenSymbol[] = ["USDm", "KESm", "NGNm", "EURm", "USDC", "USDT", "CELO", "GOOD_DOLLAR"];
 
 export function tokenAddress(symbol: TokenSymbol, chainId: number = CELO_MAINNET_CHAIN_ID): `0x${string}` {
   const info = TOKENS[symbol];
