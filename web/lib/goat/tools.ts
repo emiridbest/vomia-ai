@@ -19,6 +19,7 @@ import { celo } from "viem/chains";
 import { rpcUrl } from "../chains";
 import { DEFAULT_STRATEGY_TOKENS, TOKENS, type TokenSymbol } from "../tokens";
 import { reviewProposedProfile, DEFAULT_RISK_PROFILE } from "../strategy/riskProfile";
+import { executeDca } from "../strategy/executor";
 import { connectDB } from "../db/connection";
 import { RiskProfile as RiskProfileModel, User } from "../db/models";
 
@@ -91,6 +92,33 @@ export function vaultTools(vaultAddress: Address | null, userId: string | null, 
           })
         );
         return { vaultAddress, paused, balances };
+      },
+    }),
+
+    executeSwapNow: tool({
+      description:
+        "Execute an immediate swap INSIDE the user's vault, converting one allow-listed token to another, right now. This does NOT check whether the trade is 'profitable' — the autonomous rebalance strategy does that on its own schedule; this tool exists for when the user explicitly asks to convert/swap/exchange tokens they already hold in their vault. It still gets a real quote and applies the user's own slippage tolerance. Do NOT use this for withdrawals (money leaving the vault to the user's own wallet) — use prepareWithdrawal for that instead. ALWAYS state the exact tokenIn, tokenOut, and amount back to the user and get explicit confirmation before calling this — it executes immediately with no separate signature step and cannot be undone.",
+      parameters: z.object({
+        tokenIn: z.string().describe("Token symbol to swap FROM, e.g. 'KESm'"),
+        tokenOut: z.string().describe("Token symbol to swap TO, e.g. 'USDm'"),
+        amount: z.string().describe("Human-readable amount of tokenIn to swap, e.g. '3840.87'"),
+      }),
+      execute: async ({ tokenIn, tokenOut, amount }) => {
+        if (!vaultAddress) return { error: "This user hasn't created a vault yet." };
+        if (!userId) return { error: "No user context — this should be called from an authenticated session." };
+        const inInfo = TOKENS[tokenIn as TokenSymbol];
+        const outInfo = TOKENS[tokenOut as TokenSymbol];
+        if (!inInfo) return { error: `Unknown token '${tokenIn}'.` };
+        if (!outInfo) return { error: `Unknown token '${tokenOut}'.` };
+        const parsedAmount = Number(amount);
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return { error: "Invalid amount." };
+        const amountIn = BigInt(Math.floor(parsedAmount * 10 ** inInfo.decimals));
+
+        await connectDB();
+        const profile = await RiskProfileModel.findOne({ userId });
+        const maxSlippageBps = profile?.maxSlippageBps ?? DEFAULT_RISK_PROFILE.maxSlippageBps;
+
+        return executeDca(vaultAddress, userId, tokenIn as TokenSymbol, tokenOut as TokenSymbol, amountIn, maxSlippageBps, "rebalance");
       },
     }),
 
