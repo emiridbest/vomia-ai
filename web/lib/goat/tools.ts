@@ -48,6 +48,13 @@ const VAULT_READ_ABI = [
     inputs: [{ name: "", type: "address" }],
     outputs: [{ type: "bool" }],
   },
+  {
+    type: "function",
+    name: "maxSingleTrade",
+    stateMutability: "view",
+    inputs: [{ name: "", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
 ] as const;
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
@@ -113,6 +120,24 @@ export function vaultTools(vaultAddress: Address | null, userId: string | null, 
         const parsedAmount = Number(amount);
         if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) return { error: "Invalid amount." };
         const amountIn = BigInt(Math.floor(parsedAmount * 10 ** inInfo.decimals));
+
+        // Check the vault's own on-chain caps before attempting — cheaper
+        // and clearer than letting a doomed transaction revert and having
+        // to explain a generic failure after the fact.
+        const [maxSingleTrade, remainingDaily] = await Promise.all([
+          publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "maxSingleTrade", args: [inInfo.address] }),
+          publicClient.readContract({ address: vaultAddress, abi: VAULT_READ_ABI, functionName: "remainingDailyAllowance", args: [inInfo.address] }),
+        ]);
+        const cap = maxSingleTrade < remainingDaily ? maxSingleTrade : remainingDaily;
+        if (amountIn > cap) {
+          return {
+            error: `${amount} ${tokenIn} exceeds this vault's cap for ${tokenIn}: max ${
+              (Number(maxSingleTrade) / 10 ** inInfo.decimals).toString()
+            } per trade, ${(Number(remainingDaily) / 10 ** inInfo.decimals).toString()} remaining today. Try swapping up to ${(
+              Number(cap) / 10 ** inInfo.decimals
+            ).toString()} ${tokenIn} instead, or raise the cap via "Activate default trading pairs" on the dashboard.`,
+          };
+        }
 
         await connectDB();
         const profile = await RiskProfileModel.findOne({ userId });

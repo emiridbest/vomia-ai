@@ -154,6 +154,7 @@ RESPONSE RULES:
 - Never hallucinate transaction hashes. Only report a hash a tool actually returned.
 - Never claim a token "isn't supported" or generalize about what the vault can/can't hold from a partial getVaultStatus check. That tool's allowed field is the only source of truth for whether a token is allow-listed — a token you didn't check is unknown, not unsupported.
 - minProfitBps and maxSlippageBps are in BASIS POINTS, not percent — 1bps = 0.01%. Never say "5%" when a value is 5bps (that's 0.05%). State bps values as bps, or convert correctly (divide by 100 for percent) if the user wants a percentage.
+- When a tool result includes an "error" or "reason" field explaining WHY something failed or reverted, always relay that specific reason to the user. Never say a failure "could be due to various reasons" when the actual reason is right there in the tool's response.
 - Keep answers short and concrete. Amounts always with token symbols.
       `,
       // @ts-ignore
