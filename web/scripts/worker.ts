@@ -60,6 +60,14 @@ const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl())
 const VAULT_BALANCE_ABI = [
   { type: "function", name: "tokenBalance", stateMutability: "view", inputs: [{ name: "token", type: "address" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "owner", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+  { type: "function", name: "maxSingleTrade", stateMutability: "view", inputs: [{ name: "", type: "address" }], outputs: [{ type: "uint256" }] },
+  {
+    type: "function",
+    name: "remainingDailyAllowance",
+    stateMutability: "view",
+    inputs: [{ name: "token", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
 ] as const;
 
 const FACTORY_ADDRESS = process.env.NEXT_PUBLIC_VAULT_FACTORY_ADDRESS as Address | undefined;
@@ -120,11 +128,19 @@ async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol
 
 /**
  * If this user has hit the cycle limit for tokenIn->tokenOut, swaps the
- * vault's entire current tokenOut balance back to tokenIn (unconditional,
- * same as DCA — this is housekeeping to prevent exhaustion, not a
- * profit-gated trade) and returns true so the caller skips its normal
- * forward-trade logic for this pair this tick. Returns false if not due,
- * or if there's nothing to cycle back.
+ * vault's current tokenOut balance back to tokenIn (unconditional, same as
+ * DCA — this is housekeeping to prevent exhaustion, not a profit-gated
+ * trade) and returns true so the caller skips its normal forward-trade
+ * logic for this pair this tick. Returns false if not due, or if there's
+ * nothing to cycle back.
+ *
+ * The amount is clamped to the vault's own on-chain caps (maxSingleTrade
+ * and remainingDailyAllowance) — without this, an accumulated balance
+ * above the per-trade cap made every cycle-back attempt revert with
+ * OverSingleTradeCap, then retry the identical doomed swap every tick,
+ * burning operator gas each time (observed live: a 146-CELO balance
+ * against a 50/trade cap). Clamped cycle-backs drain the balance in
+ * cap-sized chunks across successive ticks instead.
  */
 async function cycleBackIfDue(
   user: any,
@@ -137,15 +153,31 @@ async function cycleBackIfDue(
   const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
   if (forwardCount < cycleLimit) return false;
 
-  const balance = await publicClient.readContract({
-    address: user.vaultAddress as Address,
-    abi: VAULT_BALANCE_ABI,
-    functionName: "tokenBalance",
-    args: [TOKENS[tokenOut].address],
-  });
-  if (balance === 0n) return false;
+  const tokenOutAddress = TOKENS[tokenOut].address;
+  const [balance, maxSingle, remainingDaily] = await Promise.all([
+    publicClient.readContract({ address: user.vaultAddress as Address, abi: VAULT_BALANCE_ABI, functionName: "tokenBalance", args: [tokenOutAddress] }),
+    publicClient.readContract({ address: user.vaultAddress as Address, abi: VAULT_BALANCE_ABI, functionName: "maxSingleTrade", args: [tokenOutAddress] }),
+    publicClient.readContract({
+      address: user.vaultAddress as Address,
+      abi: VAULT_BALANCE_ABI,
+      functionName: "remainingDailyAllowance",
+      args: [tokenOutAddress],
+    }),
+  ]);
 
-  const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, balance, maxSlippageBps, strategy);
+  let amount = balance;
+  if (amount > maxSingle) amount = maxSingle;
+  if (amount > remainingDaily) amount = remainingDaily;
+  if (amount === 0n) {
+    if (balance > 0n) {
+      console.log(
+        `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: blocked — balance ${balance} but vault cap allows 0 right now (daily allowance spent or token capped at 0).`
+      );
+    }
+    return false;
+  }
+
+  const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, amount, maxSlippageBps, strategy);
   console.log(
     `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn} (after ${forwardCount} buys): ${result.status}` +
       (result.txHash ? ` tx=${result.txHash}` : "") +
