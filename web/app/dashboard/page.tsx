@@ -94,16 +94,16 @@ const ERC20_TRANSFER_ABI = [
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
 const ACTIVATION_TOKENS: TokenSymbol[] = DEFAULT_STRATEGY_TOKENS;
-const DEFAULT_MAX_SINGLE_TRADE = "50";
-const DEFAULT_DAILY_CAP = "500";
-// Per-token overrides for tokens whose "50/500" doesn't make sense at their
-// unit value (e.g. G$ is worth a small fraction of a cent, so 50/500 G$ is
-// negligible) or where larger single-swap headroom was explicitly requested.
-const CAP_OVERRIDES: Partial<Record<TokenSymbol, { maxSingleTrade: string; dailyCap: string }>> = {
-  GOOD_DOLLAR: { maxSingleTrade: "5000000", dailyCap: "5000000" },
-  KESm: { maxSingleTrade: "5000", dailyCap: "10000" },
-  NGNm: { maxSingleTrade: "50000", dailyCap: "100000" },
-};
+// Effectively-unlimited caps, at the owner's explicit request, so the agent
+// can trade all day without hitting a ceiling (and cycle-backs can return an
+// entire accumulated balance in one transaction instead of cap-sized
+// chunks). Deliberate trade-off, stated plainly: these caps are the vault's
+// blast-radius bound if the operator key is ever compromised (SECURITY.md's
+// core argument), so raising them this high trades that protection away —
+// acceptable for a small hackathon vault, not a default to keep for real
+// user funds.
+const DEFAULT_MAX_SINGLE_TRADE = "1000000000"; // 1 billion tokens per trade
+const DEFAULT_DAILY_CAP = "1000000000"; // 1 billion tokens per rolling 24h
 
 export default function Dashboard() {
   const { isConnected, address, web3AuthSub } = useVomiaIdentity();
@@ -364,7 +364,6 @@ export default function Dashboard() {
         label: symbol,
         run: () => {
           const info = TOKENS[symbol];
-          const override = CAP_OVERRIDES[symbol];
           return writeContractAsync({
             address: vaultAddress,
             abi: VAULT_ABI,
@@ -372,8 +371,8 @@ export default function Dashboard() {
             args: [
               tokenAddress(symbol, chain.id),
               true,
-              parseUnits(override?.maxSingleTrade ?? DEFAULT_MAX_SINGLE_TRADE, info.decimals),
-              parseUnits(override?.dailyCap ?? DEFAULT_DAILY_CAP, info.decimals),
+              parseUnits(DEFAULT_MAX_SINGLE_TRADE, info.decimals),
+              parseUnits(DEFAULT_DAILY_CAP, info.decimals),
             ],
           });
         },
@@ -390,11 +389,9 @@ export default function Dashboard() {
         return;
       }
     }
-    const capsSummary = ACTIVATION_TOKENS.map((symbol) => {
-      const o = CAP_OVERRIDES[symbol];
-      return `${symbol} ${o?.maxSingleTrade ?? DEFAULT_MAX_SINGLE_TRADE}/trade,${o?.dailyCap ?? DEFAULT_DAILY_CAP}/day`;
-    }).join(" · ");
-    setActivationStatus(`Activated ✓ — ${capsSummary}. Adjust anytime.`);
+    setActivationStatus(
+      `Activated ✓ — ${ACTIVATION_TOKENS.join(", ")} allow-listed with effectively-unlimited caps (${DEFAULT_MAX_SINGLE_TRADE}/trade, ${DEFAULT_DAILY_CAP}/day each). Adjust anytime.`
+    );
   }
 
   async function putProfile(acknowledge: boolean) {
@@ -546,8 +543,9 @@ export default function Dashboard() {
               <h4 style={{ marginTop: 16, fontSize: "0.85rem" }}>Activate trading</h4>
               <p style={{ color: "var(--cream-dim)", fontSize: "0.8rem", marginBottom: 8 }}>
                 Allow-lists Mento + Uniswap as trading venues and {ACTIVATION_TOKENS.join("/")} as tradeable tokens
-                (default caps {DEFAULT_MAX_SINGLE_TRADE}/trade, {DEFAULT_DAILY_CAP}/day, except G$ 5,000,000/5,000,000,
-                KESm 5,000/10,000, NGNm 50,000/100,000 — several transactions, sign each one). Safe to run again to update caps.
+                with effectively-unlimited caps ({DEFAULT_MAX_SINGLE_TRADE} per trade and per day, each token — several
+                transactions, sign each one). Safe to run again to update caps. Note: high caps mean the on-chain
+                spend limits no longer bound the agent — only use with funds you&rsquo;re comfortable trading freely.
               </p>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 <button className="btn btn-primary" onClick={activateDefaultTrading}>
