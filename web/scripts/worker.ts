@@ -148,10 +148,29 @@ async function cycleBackIfDue(
   tokenOut: TokenSymbol,
   cycleLimit: number,
   strategy: "rebalance" | "dca",
-  maxSlippageBps: number
+  maxSlippageBps: number,
+  neededIn: bigint
 ): Promise<boolean> {
+  // Two triggers: the scheduled one (N forward buys since the last
+  // reverse), and a funding-short one — if the vault can no longer cover
+  // the next forward trade's tokenIn amount, cycle back early to replenish
+  // rather than letting every forward attempt fail on the token transfer
+  // (observed live: USDm drained to 0.13 while the accumulated value sat
+  // in KESm/NGNm/EURm, and every 10-USDm attempt reverted with
+  // "SafeERC20: low-level call failed" until a scheduled cycle-back
+  // happened to come around).
   const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
-  if (forwardCount < cycleLimit) return false;
+  let trigger = forwardCount >= cycleLimit ? `after ${forwardCount} buys` : null;
+  if (!trigger) {
+    const balanceIn = await publicClient.readContract({
+      address: user.vaultAddress as Address,
+      abi: VAULT_BALANCE_ABI,
+      functionName: "tokenBalance",
+      args: [TOKENS[tokenIn].address],
+    });
+    if (balanceIn < neededIn) trigger = `replenishing ${tokenIn} (balance below trade size)`;
+  }
+  if (!trigger) return false;
 
   const tokenOutAddress = TOKENS[tokenOut].address;
   const [balance, maxSingle, remainingDaily] = await Promise.all([
@@ -179,11 +198,22 @@ async function cycleBackIfDue(
 
   const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, amount, maxSlippageBps, strategy);
   console.log(
-    `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn} (after ${forwardCount} buys): ${result.status}` +
+    `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn} (${trigger}): ${result.status}` +
       (result.txHash ? ` tx=${result.txHash}` : "") +
       ` (${result.reason})`
   );
   return true;
+}
+
+/** True if the vault holds at least `amountIn` of `tokenIn` — checked before a forward trade so an unfundable attempt is skipped with a clear log line instead of failing on the token transfer. */
+async function hasFunding(user: any, tokenIn: TokenSymbol, amountIn: bigint): Promise<boolean> {
+  const balance = await publicClient.readContract({
+    address: user.vaultAddress as Address,
+    abi: VAULT_BALANCE_ABI,
+    functionName: "tokenBalance",
+    args: [TOKENS[tokenIn].address],
+  });
+  return balance >= amountIn;
 }
 
 async function runRebalance(user: any, profile: any) {
@@ -201,11 +231,16 @@ async function runRebalance(user: any, profile: any) {
       ];
 
   for (const pair of pairs) {
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, REBALANCE_CYCLE_LIMIT, "rebalance", profile.maxSlippageBps);
-    if (cycled) continue;
-
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
+
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, REBALANCE_CYCLE_LIMIT, "rebalance", profile.maxSlippageBps, amountIn);
+    if (cycled) continue;
+
+    if (!(await hasFunding(user, pair.tokenIn, amountIn))) {
+      console.log(`[${user.walletAddress.slice(0, 8)}] rebalance ${pair.tokenIn}->${pair.tokenOut}: skipped — vault ${pair.tokenIn} balance below trade size and nothing to cycle back.`);
+      continue;
+    }
 
     const scan = await scanPair(pair.tokenIn, pair.tokenOut, amountIn, SCAN_AMOUNT_HUMAN, profile);
 
@@ -225,7 +260,10 @@ async function runRebalance(user: any, profile: any) {
 
 async function runDca(user: any, profile: any) {
   for (const pair of DCA_PAIRS) {
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, DCA_CYCLE_LIMIT, "dca", profile.maxSlippageBps);
+    const decimalsIn = TOKENS[pair.tokenIn].decimals;
+    const amountIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 10 ** decimalsIn));
+
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, DCA_CYCLE_LIMIT, "dca", profile.maxSlippageBps, amountIn);
     if (cycled) continue;
 
     const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenIn: pair.tokenIn, tokenOut: pair.tokenOut }).sort({
@@ -233,8 +271,10 @@ async function runDca(user: any, profile: any) {
     });
     if (lastRun && Date.now() - lastRun.createdAt.getTime() < DCA_INTERVAL_MS) continue;
 
-    const decimalsIn = TOKENS[pair.tokenIn].decimals;
-    const amountIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 10 ** decimalsIn));
+    if (!(await hasFunding(user, pair.tokenIn, amountIn))) {
+      console.log(`[${user.walletAddress.slice(0, 8)}] dca ${pair.tokenIn}->${pair.tokenOut}: skipped — vault ${pair.tokenIn} balance below buy size and nothing to cycle back.`);
+      continue;
+    }
 
     const result = await executeDca(user.vaultAddress, user._id.toString(), pair.tokenIn, pair.tokenOut, amountIn, profile.maxSlippageBps);
     console.log(
