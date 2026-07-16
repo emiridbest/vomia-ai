@@ -1,0 +1,13 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#registration-v1",
+  "name": "Vomia",
+  "description": "Non-custodial DeFAI agent on Celo. Users log in with a social account (Web3Auth MPC), open a personal on-chain vault only they can withdraw from, and set a strategy: profit-gated FX rebalancing across Mento and Uniswap (measured against Mento's SortedOracles reference rate), or scheduled DCA into CELO and G$ — every trade capped by the vault's own on-chain per-trade and daily limits and tagged with an ERC-8021 attribution suffix. Paid x402 APIs available to other agents with no account or API key: fx-route returns the best cross-venue quote for a Celo stablecoin FX conversion, and check answers whether a pair is worth rebalancing right now.",
+  "services": [
+    { "name": "web", "endpoint": "https://vomiaagent.vercel.app" },
+    { "name": "A2A", "endpoint": "https://vomiaagent.vercel.app/.well-known/agent.json" },
+    { "name": "x402", "endpoint": "https://vomiaagent.vercel.app/api/x402/fx-route" },
+    { "name": "x402", "endpoint": "https://vomiaagent.vercel.app/api/x402/check" }
+  ],
+  "supportedTrust": ["reputation"],
+  "onAigora": false
+}
