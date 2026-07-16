@@ -33,6 +33,28 @@ const config: HardhatUserConfig = {
       accounts: [DEPLOYER_KEY],
     },
   },
+  etherscan: {
+    // Etherscan v2 unified API key — one key covers every supported chain,
+    // including Celo/Celoscan. Needed only for `hardhat verify`, never for
+    // deploys. (The old per-explorer v1 endpoints were retired mid-2025;
+    // this hardhat-verify version doesn't know chainId 42220 natively, so
+    // the v2 endpoint is wired up via customChains with the chainid param.)
+    apiKey: {
+      celo: process.env.CELOSCAN_API_KEY || "",
+    },
+    customChains: [
+      {
+        network: "celo",
+        chainId: 42220,
+        urls: { apiURL: "https://api.etherscan.io/v2/api?chainid=42220", browserURL: "https://celoscan.io" },
+      },
+    ],
+  },
+  // Sourcify verification needs no API key and is read by Blockscout's Celo
+  // explorer — a useful fallback when the Etherscan v2 endpoint is flaky.
+  sourcify: {
+    enabled: true,
+  },
 };
 
 export default config;
