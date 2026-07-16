@@ -17,8 +17,9 @@
  *     (for slippage protection) and still won't execute with no route.
  */
 import { v4 as uuidv4 } from "uuid";
-import { encodeFunctionData, keccak256, toBytes, type Address } from "viem";
+import { createPublicClient, encodeFunctionData, http, keccak256, toBytes, type Address } from "viem";
 import { getOperatorWalletClient } from "../vault/operatorSigner";
+import { activeChain, rpcUrl } from "../chains";
 import {
   buildMentoSwapCalldata,
   getMentoQuote,
@@ -61,6 +62,8 @@ interface Venue {
   venue: "mento" | "uniswap";
   amountOut: bigint;
 }
+
+const publicClient = createPublicClient({ chain: activeChain(), transport: http(rpcUrl()) });
 
 /** Sends the tagged executeSwap call and logs the result — shared by every strategy's execution path. */
 async function sendTaggedSwap(params: {
@@ -111,6 +114,23 @@ async function sendTaggedSwap(params: {
       account: walletClient.account!,
     });
 
+    // Wait for the receipt before returning. This is what serializes
+    // same-tick trades: every strategy awaits this function, so the next
+    // send only fetches its nonce after this transaction has mined —
+    // without it, a tick that fired several trades had all but the first
+    // collide with "replacement transaction underpriced" (observed live:
+    // a +124bps trade lost to a nonce race, not to the market). It also
+    // makes the logged status the real on-chain outcome instead of an
+    // optimistic "submitted".
+    let status: "submitted" | "settled" | "reverted" = "submitted";
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+      status = receipt.status === "success" ? "settled" : "reverted";
+    } catch {
+      // Receipt didn't arrive within the timeout — the tx may still mine;
+      // leave it recorded as submitted rather than guessing an outcome.
+    }
+
     await TradeLog.create({
       userId: params.userId,
       vaultAddress: params.vaultAddress,
@@ -120,11 +140,14 @@ async function sendTaggedSwap(params: {
       tokenOut: params.tokenOut,
       amountIn: params.amountIn.toString(),
       amountOut: params.amountOut.toString(),
-      status: "submitted",
+      status,
       txHash,
       quotedProfitBps: params.quotedProfitBps,
     });
 
+    if (status === "reverted") {
+      return { status: "reverted", txHash, actionId, reason: "Transaction mined but reverted on-chain — see the tx on Celoscan for the revert reason." };
+    }
     return { status: "settled", txHash, actionId, reason: params.reasonOnSuccess };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
