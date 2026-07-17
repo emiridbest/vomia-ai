@@ -73,20 +73,12 @@ const SWAP_ROUTER_02_ABI = [
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
 
-/** Common Uniswap V3 fee tiers, in hundredths of a bip (500 = 0.05%, 3000 = 0.3%). */
-export const FEE_TIERS = [500, 3000, 10000] as const;
+/** All Uniswap V3 fee tiers, in hundredths of a bip (500 = 0.05%, 3000 = 0.3%). */
+export const FEE_TIERS = [100, 500, 3000, 10000] as const;
 
-export async function getUniswapQuote(
-  tokenIn: TokenSymbol,
-  tokenOut: TokenSymbol,
-  amountIn: bigint,
-  fee: number = 3000
-): Promise<bigint | null> {
+async function quoteAtFee(tokenIn: TokenSymbol, tokenOut: TokenSymbol, amountIn: bigint, fee: number): Promise<bigint | null> {
   const quoterAddress = process.env.UNISWAP_QUOTER_V2_ADDRESS as Address | undefined;
-  if (!quoterAddress) {
-    console.warn("UNISWAP_QUOTER_V2_ADDRESS not set — skipping Uniswap as a venue. See this file's header comment.");
-    return null;
-  }
+  if (!quoterAddress) return null;
   try {
     const { result } = await publicClient.simulateContract({
       address: quoterAddress,
@@ -107,6 +99,40 @@ export async function getUniswapQuote(
     // No pool at this fee tier, or insufficient liquidity — not a bug, just "no route here"
     return null;
   }
+}
+
+/**
+ * Best single-hop quote across every fee tier — the Uniswap frontend's smart
+ * order router checks all tiers (and multi-hops), so quoting only the 0.3%
+ * pool systematically underprices Uniswap on pairs whose real liquidity
+ * lives in a different tier. Returns the winning tier alongside the amount
+ * so the swap calldata can be built against the same pool that was quoted.
+ */
+export async function getBestUniswapQuote(
+  tokenIn: TokenSymbol,
+  tokenOut: TokenSymbol,
+  amountIn: bigint
+): Promise<{ amountOut: bigint; fee: number } | null> {
+  const quoterAddress = process.env.UNISWAP_QUOTER_V2_ADDRESS as Address | undefined;
+  if (!quoterAddress) {
+    console.warn("UNISWAP_QUOTER_V2_ADDRESS not set — skipping Uniswap as a venue. See this file's header comment.");
+    return null;
+  }
+  const results = await Promise.all(FEE_TIERS.map((fee) => quoteAtFee(tokenIn, tokenOut, amountIn, fee).then((amountOut) => ({ fee, amountOut }))));
+  let best: { amountOut: bigint; fee: number } | null = null;
+  for (const r of results) {
+    if (r.amountOut !== null && (best === null || r.amountOut > best.amountOut)) best = { amountOut: r.amountOut, fee: r.fee };
+  }
+  return best;
+}
+
+export async function getUniswapQuote(
+  tokenIn: TokenSymbol,
+  tokenOut: TokenSymbol,
+  amountIn: bigint
+): Promise<bigint | null> {
+  const best = await getBestUniswapQuote(tokenIn, tokenOut, amountIn);
+  return best?.amountOut ?? null;
 }
 
 export function buildUniswapSwapCalldata(params: {

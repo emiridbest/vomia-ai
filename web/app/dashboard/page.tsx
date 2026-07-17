@@ -10,6 +10,7 @@ import { activeChain } from "../../lib/chains";
 import { DEFAULT_STRATEGY_TOKENS, TOKENS, tokenAddress, type TokenSymbol } from "../../lib/tokens";
 import { MENTO_BROKER_ADDRESS } from "../../lib/dex/mento";
 import { UNISWAP_SWAP_ROUTER_02 } from "../../lib/dex/uniswap";
+import { SQUID_ROUTER_CELO } from "../../lib/dex/squidSameChain";
 import { attachAttributionTag } from "../../lib/attribution";
 
 interface TradeRow {
@@ -128,7 +129,7 @@ export default function Dashboard() {
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [feedNote, setFeedNote] = useState<string | null>(null);
   const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 50 });
-  const [strategy, setStrategy] = useState<"rebalance" | "dca">("rebalance");
+  const [strategy, setStrategy] = useState<"rebalance" | "dca" | "arbitrage">("rebalance");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "review" | "saved">("idle");
   const [profileError, setProfileError] = useState<string | null>(null);
@@ -200,6 +201,7 @@ export default function Dashboard() {
           maxTradesPerDay: data.profile.maxTradesPerDay,
         });
         if (data.profile.enabledStrategies?.includes("dca")) setStrategy("dca");
+        if (data.profile.enabledStrategies?.includes("arbitrage")) setStrategy("arbitrage");
       })
       .catch(() => {});
   }, [address]);
@@ -358,6 +360,16 @@ export default function Dashboard() {
             abi: VAULT_ABI,
             functionName: "setTargetAllowed",
             args: [UNISWAP_SWAP_ROUTER_02, true],
+          }),
+      },
+      {
+        label: "Squid router",
+        run: () =>
+          writeContractAsync({
+            address: vaultAddress,
+            abi: VAULT_ABI,
+            functionName: "setTargetAllowed",
+            args: [SQUID_ROUTER_CELO, true],
           }),
       },
       ...ACTIVATION_TOKENS.map((symbol) => ({
@@ -589,9 +601,10 @@ export default function Dashboard() {
               <>
                 <div className="field-row">
                   <label htmlFor="strategy">Strategy</label>
-                  <select id="strategy" value={strategy} onChange={(e) => setStrategy(e.target.value as "rebalance" | "dca")}>
+                  <select id="strategy" value={strategy} onChange={(e) => setStrategy(e.target.value as "rebalance" | "dca" | "arbitrage")}>
                     <option value="rebalance">Rebalance — trade only when it clears your profit margin</option>
                     <option value="dca">DCA — buy 1 USDm worth of CELO + G$ every 30 minutes, regardless of price</option>
+                    <option value="arbitrage">Arbitrage (experiment) — buy CELO on Squid, sell on Uniswap, 1 USDm every 30 minutes</option>
                   </select>
                 </div>
                 <div className="field-row">

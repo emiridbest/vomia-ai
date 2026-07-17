@@ -38,7 +38,7 @@ import { celo } from "viem/chains";
 import { connectDB } from "../lib/db/connection";
 import { User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
-import { executeIfProfitable, executeDca } from "../lib/strategy/executor";
+import { executeIfProfitable, executeDca, executeVenueSwap } from "../lib/strategy/executor";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
 import { rpcUrl } from "../lib/chains";
@@ -55,6 +55,15 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 
 const REBALANCE_CYCLE_LIMIT = 3; // forward trades into a currency before swapping the balance back
 const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated balance back
+
+// The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
+// settle a disagreement between API round-trip quotes — which say this
+// combination loses ~4.5%/trip — and manual frontend checks that suggested
+// it's profitable). Sized and paced so 24h of running settles the question
+// for a couple of dollars either way rather than draining the vault:
+// 1 USDm per trip, one trip per 30 minutes, realized P&L logged per trip.
+const ARB_AMOUNT_HUMAN = 1;
+const ARB_INTERVAL_MS = 30 * 60 * 1000;
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
 const VAULT_BALANCE_ABI = [
@@ -285,6 +294,52 @@ async function runDca(user: any, profile: any) {
   }
 }
 
+async function runArbitrage(user: any, profile: any) {
+  const tag = `[${user.walletAddress.slice(0, 8)}] arb`;
+
+  // One trip per interval, gated on the last arbitrage-strategy trade.
+  const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "arbitrage" }).sort({ createdAt: -1 });
+  if (lastRun && Date.now() - lastRun.createdAt.getTime() < ARB_INTERVAL_MS) return;
+
+  const amountIn = BigInt(ARB_AMOUNT_HUMAN) * 10n ** BigInt(TOKENS.USDm.decimals);
+  if (!(await hasFunding(user, "USDm", amountIn))) {
+    console.log(`${tag}: skipped — vault can't fund ${ARB_AMOUNT_HUMAN} USDm.`);
+    return;
+  }
+
+  // Leg 1: buy CELO on Squid.
+  const leg1 = await executeVenueSwap("squid", user.vaultAddress, user._id.toString(), "USDm", "CELO", amountIn, profile.maxSlippageBps);
+  console.log(`${tag} leg1 USDm->CELO via squid: ${leg1.status}` + (leg1.txHash ? ` tx=${leg1.txHash}` : "") + ` (${leg1.reason})`);
+  if (leg1.status !== "settled") return;
+
+  // Leg 2: sell the vault's whole CELO balance on Uniswap (the vault held 0
+  // CELO before leg 1 on this strategy's vault; selling the full balance
+  // keeps the experiment's books clean between trips).
+  const celoBalance = await publicClient.readContract({
+    address: user.vaultAddress as Address,
+    abi: VAULT_BALANCE_ABI,
+    functionName: "tokenBalance",
+    args: [TOKENS.CELO.address],
+  });
+  if (celoBalance === 0n) {
+    console.log(`${tag} leg2: nothing to sell (CELO balance 0 after leg 1?)`);
+    return;
+  }
+  const leg2 = await executeVenueSwap("uniswap", user.vaultAddress, user._id.toString(), "CELO", "USDm", celoBalance, profile.maxSlippageBps);
+  console.log(`${tag} leg2 CELO->USDm via uniswap: ${leg2.status}` + (leg2.txHash ? ` tx=${leg2.txHash}` : "") + ` (${leg2.reason})`);
+
+  // Realized round-trip P&L, from the vault's own USDm balance movement.
+  if (leg2.status === "settled") {
+    const usdmAfter = await publicClient.readContract({
+      address: user.vaultAddress as Address,
+      abi: VAULT_BALANCE_ABI,
+      functionName: "tokenBalance",
+      args: [TOKENS.USDm.address],
+    });
+    console.log(`${tag} round trip complete — vault USDm now ${(Number(usdmAfter) / 1e18).toFixed(6)} (spent ${ARB_AMOUNT_HUMAN} USDm on leg 1).`);
+  }
+}
+
 async function tick() {
   if (ticking) return; // never let a slow tick overlap the next one
   ticking = true;
@@ -322,6 +377,7 @@ async function tick() {
       console.log(`[${user.walletAddress.slice(0, 8)}] strategies: ${strategies.join(", ")}`);
       if (strategies.includes("rebalance")) await runRebalance(user, profile);
       if (strategies.includes("dca")) await runDca(user, profile);
+      if (strategies.includes("arbitrage")) await runArbitrage(user, profile);
     }
   } catch (err) {
     console.error("Worker tick failed:", err instanceof Error ? err.message : err);

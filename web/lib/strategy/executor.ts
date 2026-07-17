@@ -27,7 +27,8 @@ import {
   findExchangeId,
   MENTO_BIPOOL_MANAGER,
 } from "../dex/mento";
-import { buildUniswapSwapCalldata, getUniswapQuote, UNISWAP_SWAP_ROUTER_02 } from "../dex/uniswap";
+import { buildUniswapSwapCalldata, getBestUniswapQuote, getUniswapQuote, UNISWAP_SWAP_ROUTER_02 } from "../dex/uniswap";
+import { getSquidSameChainRoute } from "../dex/squidSameChain";
 import { TOKENS, type TokenSymbol } from "../tokens";
 import type { ScanResult } from "./spreadScanner";
 import { TradeLog } from "../db/models";
@@ -69,7 +70,7 @@ const publicClient = createPublicClient({ chain: activeChain(), transport: http(
 async function sendTaggedSwap(params: {
   vaultAddress: Address;
   userId: string;
-  strategy: "rebalance" | "dca";
+  strategy: "rebalance" | "dca" | "arbitrage";
   tokenIn: TokenSymbol;
   tokenOut: TokenSymbol;
   amountIn: bigint;
@@ -208,11 +209,17 @@ export async function executeIfProfitable(
       amountOutMin: minAmountOut,
     });
   } else {
+    // Re-quote to learn WHICH fee tier won — the swap must target the same
+    // pool the quote came from, not a hardcoded 0.3% tier.
+    const best = await getBestUniswapQuote(scan.tokenIn, scan.tokenOut, scan.amountIn);
+    if (!best) {
+      return { status: "skipped-no-route", actionId: keccak256(toBytes(uuidv4())), reason: "Uniswap route disappeared between quote and execute — skipping this tick." };
+    }
     target = UNISWAP_SWAP_ROUTER_02;
     callData = buildUniswapSwapCalldata({
       tokenIn: TOKENS[scan.tokenIn].address,
       tokenOut: TOKENS[scan.tokenOut].address,
-      fee: 3000,
+      fee: best.fee,
       recipient: vaultAddress, // swapped tokens must come back to the vault, not the operator
       amountIn: scan.amountIn,
       amountOutMin: minAmountOut,
@@ -304,11 +311,19 @@ export async function executeDca(
       amountOutMin: minAmountOut,
     });
   } else {
+    const best = await getBestUniswapQuote(tokenIn, tokenOut, amountIn);
+    if (!best) {
+      return {
+        status: "skipped-no-route",
+        actionId: keccak256(toBytes(uuidv4())),
+        reason: "Uniswap route disappeared between quote and execute — skipping this tick.",
+      };
+    }
     target = UNISWAP_SWAP_ROUTER_02;
     callData = buildUniswapSwapCalldata({
       tokenIn: TOKENS[tokenIn].address,
       tokenOut: TOKENS[tokenOut].address,
-      fee: 3000,
+      fee: best.fee,
       recipient: vaultAddress,
       amountIn,
       amountOutMin: minAmountOut,
@@ -328,5 +343,67 @@ export async function executeDca(
     amountOut: bestVenue.amountOut,
     reasonOnSuccess:
       strategy === "dca" ? `DCA buy: ${tokenIn} -> ${tokenOut} via ${bestVenue.venue}` : `On-demand swap: ${tokenIn} -> ${tokenOut} via ${bestVenue.venue}`,
+  });
+}
+
+/**
+ * One leg of the buy-on-Squid / sell-on-Uniswap arbitrage experiment —
+ * executes on a SPECIFIC venue (no best-venue selection), unconditionally
+ * (no profit gate; the whole point of the experiment is to measure the
+ * realized round trip), with the user's slippage tolerance still applied
+ * against the venue's own quote.
+ */
+export async function executeVenueSwap(
+  venue: "squid" | "uniswap",
+  vaultAddress: Address,
+  userId: string,
+  tokenIn: TokenSymbol,
+  tokenOut: TokenSymbol,
+  amountIn: bigint,
+  maxSlippageBps: number
+): Promise<ExecutionResult> {
+  let target: Address;
+  let callData: `0x${string}`;
+  let quotedOut: bigint;
+
+  if (venue === "squid") {
+    const route = await getSquidSameChainRoute(tokenIn, tokenOut, amountIn, vaultAddress);
+    if (!route) {
+      return { status: "skipped-no-route", actionId: keccak256(toBytes(uuidv4())), reason: "Squid returned no route (or rate-limited)." };
+    }
+    target = route.target;
+    callData = route.callData;
+    quotedOut = route.amountOut;
+  } else {
+    const best = await getBestUniswapQuote(tokenIn, tokenOut, amountIn);
+    if (!best) {
+      return { status: "skipped-no-route", actionId: keccak256(toBytes(uuidv4())), reason: "No Uniswap pool has a route for this pair." };
+    }
+    target = UNISWAP_SWAP_ROUTER_02;
+    quotedOut = best.amountOut;
+    callData = buildUniswapSwapCalldata({
+      tokenIn: TOKENS[tokenIn].address,
+      tokenOut: TOKENS[tokenOut].address,
+      fee: best.fee,
+      recipient: vaultAddress,
+      amountIn,
+      amountOutMin: (best.amountOut * BigInt(10000 - maxSlippageBps)) / 10000n,
+    });
+  }
+
+  const minAmountOut = (quotedOut * BigInt(10000 - maxSlippageBps)) / 10000n;
+
+  return sendTaggedSwap({
+    vaultAddress,
+    userId,
+    strategy: "arbitrage",
+    tokenIn,
+    tokenOut,
+    amountIn,
+    minAmountOut,
+    target,
+    callData,
+    amountOut: quotedOut,
+    reasonOnSuccess: `Arb leg: ${tokenIn} -> ${tokenOut} via ${venue}`,
   });
 }
