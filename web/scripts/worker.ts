@@ -47,7 +47,7 @@ const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
 
 const DCA_AMOUNT_HUMAN = 1; // fixed USDm spend per DCA buy, per the product spec
-const DCA_INTERVAL_MS = 3 * 60 * 1000;
+const DCA_INTERVAL_MS = 1 * 60 * 1000; // per-pair buy cadence (owner-set; rebalance cadence is the heartbeat itself)
 const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
   { tokenIn: "USDm", tokenOut: "CELO" },
   { tokenIn: "USDm", tokenOut: "GOOD_DOLLAR" },
