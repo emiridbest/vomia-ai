@@ -128,7 +128,7 @@ export default function Dashboard() {
 
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [feedNote, setFeedNote] = useState<string | null>(null);
-  const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 50 });
+  const [profile, setProfile] = useState<ProfileState>({ minProfitBps: 2, maxSlippageBps: 100, maxTradesPerDay: 5000 });
   const [strategy, setStrategy] = useState<"rebalance" | "dca" | "arbitrage">("rebalance");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "review" | "saved">("idle");

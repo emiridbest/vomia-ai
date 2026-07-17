@@ -17,7 +17,7 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: 5, // 0.05% net edge — still comfortably above the ~0bps gas floor on Celo, tuned for trade frequency over margin
+  minProfitBps: 2, // 0.02% net edge — near the gas floor on purpose: 47 measured cycles showed entry edge barely predicts realized P&L (r=-0.2), so the gate is a volume throttle more than a profit filter
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
   enabledStrategies: ["rebalance"],
