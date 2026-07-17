@@ -38,6 +38,9 @@ import { celo } from "viem/chains";
 import { connectDB } from "../lib/db/connection";
 import { User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
+import { getMentoQuote } from "../lib/dex/mento";
+import { getUniswapQuote } from "../lib/dex/uniswap";
+import { getReferenceAmountOut } from "../lib/dex/oracle";
 import { executeIfProfitable, executeDca, executeVenueSwap } from "../lib/strategy/executor";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
@@ -57,6 +60,8 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 
 const REBALANCE_CYCLE_LIMIT = 3; // forward trades into a currency before swapping the balance back
 const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated balance back
+const EXIT_MIN_EDGE_BPS = -10; // scheduled cycle-backs wait for the exit quote to be at least this close to oracle fair
+const MAX_HOLD_MS = 60 * 60 * 1000; // ...but never hold inventory longer than this waiting for a good exit
 
 // The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
 // settle a disagreement between API round-trip quotes — which say this
@@ -171,7 +176,8 @@ async function cycleBackIfDue(
   // "SafeERC20: low-level call failed" until a scheduled cycle-back
   // happened to come around).
   const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
-  let trigger = forwardCount >= cycleLimit ? `after ${forwardCount} buys` : null;
+  let scheduled = forwardCount >= cycleLimit;
+  let trigger = scheduled ? `after ${forwardCount} buys` : null;
   if (!trigger) {
     const balanceIn = await publicClient.readContract({
       address: user.vaultAddress as Address,
@@ -207,6 +213,47 @@ async function cycleBackIfDue(
     return false;
   }
 
+  // Edge-aware exit (scheduled cycle-backs only): entries average ~+15bps
+  // of genuine edge, but unconditionally selling into a ~-30bps exit
+  // spread gave all of it back — the one leak that kept realized CELO P&L
+  // slightly negative. So a scheduled exit now waits for the reverse quote
+  // to be within EXIT_MIN_EDGE_BPS of oracle fair value, checked each
+  // tick, with a hard time cap (MAX_HOLD_MS since the oldest unreversed
+  // buy) so inventory can never sit in a volatile asset indefinitely
+  // waiting for an exit that doesn't come. Funding-short replenishes stay
+  // unconditional — when USDm is exhausted, restoring tradability beats
+  // exit price.
+  if (scheduled) {
+    const [bestQuote, refOut] = await Promise.all([
+      Promise.all([
+        getMentoQuote(tokenOut, tokenIn, amount).then((q) => q?.amountOut ?? null).catch(() => null),
+        getUniswapQuote(tokenOut, tokenIn, amount).catch(() => null),
+      ]).then(([m, u]) => (m !== null && u !== null ? (m > u ? m : u) : m ?? u)),
+      getReferenceAmountOut(tokenOut, tokenIn, amount),
+    ]);
+    if (bestQuote !== null && refOut !== null && refOut > 0n) {
+      const exitEdgeBps = Number(((bestQuote - refOut) * 10000n) / refOut);
+      if (exitEdgeBps < EXIT_MIN_EDGE_BPS) {
+        const oldestForward = await TradeLog.findOne({
+          userId: user._id.toString(),
+          tokenIn,
+          tokenOut,
+          status: { $in: ["submitted", "settled"] },
+        }).sort({ createdAt: 1 });
+        const heldMs = oldestForward ? Date.now() - oldestForward.createdAt.getTime() : 0;
+        if (heldMs < MAX_HOLD_MS) {
+          console.log(
+            `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: postponed — exit edge ${exitEdgeBps}bps < ${EXIT_MIN_EDGE_BPS}bps floor (held ${(heldMs / 60000).toFixed(0)}m of ${MAX_HOLD_MS / 60000}m max).`
+          );
+          return true; // pause forward trades for this pair too — don't grow inventory while waiting to exit
+        }
+        console.log(
+          `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: max hold reached — exiting at ${exitEdgeBps}bps despite the floor.`
+        );
+      }
+    }
+  }
+
   const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, amount, maxSlippageBps, strategy);
   console.log(
     `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn} (${trigger}): ${result.status}` +
@@ -228,18 +275,16 @@ async function hasFunding(user: any, tokenIn: TokenSymbol, amountIn: bigint): Pr
 }
 
 async function runRebalance(user: any, profile: any) {
+  // CELO-only by default, based on 36h of realized results (1,804 settled
+  // trades): CELO's entry edges are genuine (its price actually moves, so
+  // the pool briefly lags fair value ~400x/day) and its spread is the
+  // tightest, netting -0.79% of turnover vs -1.3% to -2.3% on KESm/NGNm/
+  // EURm — whose large quoted "edges" (avg +180..290bps) were mostly
+  // oracle staleness, not capturable dislocations. Regional pairs can
+  // still be enabled per-user via profile.allowedTokenPairs.
   const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = profile.allowedTokenPairs?.length
     ? profile.allowedTokenPairs
-    : [
-        { tokenIn: "USDm", tokenOut: "KESm" },
-        { tokenIn: "USDm", tokenOut: "NGNm" },
-        { tokenIn: "USDm", tokenOut: "EURm" },
-        // Tightest Mento spread of the lot (typically ~-36bps vs the
-        // oracle mid, against ~-350bps on the regional pairs), so it's the
-        // pair most likely to genuinely clear the profit floor when the
-        // pool price dislocates above oracle fair value.
-        { tokenIn: "USDm", tokenOut: "CELO" },
-      ];
+    : [{ tokenIn: "USDm", tokenOut: "CELO" }];
 
   for (const pair of pairs) {
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
