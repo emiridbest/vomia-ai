@@ -58,12 +58,14 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
   { tokenIn: "USDm", tokenOut: "CELO" },
 ];
 
-const REBALANCE_CYCLE_LIMIT = 3; // forward trades into a currency before swapping the balance back
-const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated balance back
-const EXIT_MIN_EDGE_BPS = -10; // scheduled cycle-backs wait for the exit quote to be at least this close to oracle fair
-const MAX_HOLD_MS = 60 * 60 * 1000; // ...but never hold inventory longer than this waiting for a good exit
-const MAX_EXIT_POSTPONEMENTS = 3; // ...or postpone the same pair's exit more than this many times in a row
-const MAX_EXIT_REVERTS = 3; // ...or keep waiting after this many actual exit attempts reverted since the last settled one
+// Exits are no longer count-based (a fixed buys-per-cycle limit forced
+// selling on a schedule regardless of price — at 1-minute holds that was
+// pure spread bleed, observed live). Inventory now exits when the exit
+// quote is favorable, when USDm runs short (immediately, to start the next
+// cycle), or on the bounded force triggers below.
+const EXIT_MIN_EDGE_BPS = -10; // take the exit whenever the quote is at least this close to oracle fair
+const MAX_HOLD_MS = 60 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
+const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
 
 // The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
 // settle a disagreement between API round-trip quotes — which say this
@@ -126,10 +128,7 @@ async function reconcileVaultsFromChain() {
 
 let ticking = false;
 
-// Consecutive postponed scheduled exits per user+pair (in-memory — resets on
-// restart, which is fine: the max-hold clock in TradeLog is the durable
-// backstop).
-const exitPostponements = new Map<string, number>();
+
 
 /** How many tokenIn->tokenOut trades have settled since the most recent tokenOut->tokenIn (reverse) trade. */
 async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol, tokenOut: TokenSymbol): Promise<number> {
@@ -169,7 +168,6 @@ async function cycleBackIfDue(
   user: any,
   tokenIn: TokenSymbol,
   tokenOut: TokenSymbol,
-  cycleLimit: number,
   strategy: "rebalance" | "dca",
   maxSlippageBps: number,
   neededIn: bigint
@@ -183,18 +181,18 @@ async function cycleBackIfDue(
   // "SafeERC20: low-level call failed" until a scheduled cycle-back
   // happened to come around).
   const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
-  let scheduled = forwardCount >= cycleLimit;
-  let trigger = scheduled ? `after ${forwardCount} buys` : null;
-  if (!trigger) {
-    const balanceIn = await publicClient.readContract({
-      address: user.vaultAddress as Address,
-      abi: VAULT_BALANCE_ABI,
-      functionName: "tokenBalance",
-      args: [TOKENS[tokenIn].address],
-    });
-    if (balanceIn < neededIn) trigger = `replenishing ${tokenIn} (balance below trade size)`;
-  }
-  if (!trigger) return false;
+  const balanceIn = await publicClient.readContract({
+    address: user.vaultAddress as Address,
+    abi: VAULT_BALANCE_ABI,
+    functionName: "tokenBalance",
+    args: [TOKENS[tokenIn].address],
+  });
+  const fundingShort = balanceIn < neededIn;
+  // "Scheduled" now just means there is inventory worth checking an exit
+  // for — the actual go/no-go is the edge check below (take a favorable
+  // exit whenever one exists), not a buy count.
+  const scheduled = !fundingShort && forwardCount > 0;
+  const trigger = fundingShort ? `replenishing ${tokenIn} (balance below trade size)` : `after ${forwardCount} buys, exit favorable or forced`;
 
   const tokenOutAddress = TOKENS[tokenOut].address;
   const [balance, maxSingle, remainingDaily] = await Promise.all([
@@ -230,7 +228,6 @@ async function cycleBackIfDue(
   // waiting for an exit that doesn't come. Funding-short replenishes stay
   // unconditional — when USDm is exhausted, restoring tradability beats
   // exit price.
-  const pairKey = `${user._id}:${tokenOut}->${tokenIn}`;
   if (scheduled) {
     // Force the exit through (ignoring the edge floor) when any of these
     // hold: the max-hold clock ran out, the exit was already postponed
@@ -269,21 +266,16 @@ async function cycleBackIfDue(
           status: { $in: ["submitted", "settled"] },
         }).sort({ createdAt: 1 });
         const heldMs = oldestForward ? Date.now() - oldestForward.createdAt.getTime() : 0;
-        const postponed = exitPostponements.get(pairKey) ?? 0;
         const force =
           heldMs >= MAX_HOLD_MS
             ? "max hold reached"
-            : postponed >= MAX_EXIT_POSTPONEMENTS
-              ? `${postponed} postponements used up`
-              : revertedReverses >= MAX_EXIT_REVERTS
-                ? `${revertedReverses} reverted exit attempts`
-                : null;
+            : revertedReverses >= MAX_EXIT_REVERTS
+              ? `${revertedReverses} reverted exit attempts`
+              : null;
         if (!force) {
-          exitPostponements.set(pairKey, postponed + 1);
-          console.log(
-            `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: postponed (${postponed + 1}/${MAX_EXIT_POSTPONEMENTS}) — exit edge ${exitEdgeBps}bps < ${EXIT_MIN_EDGE_BPS}bps floor (held ${(heldMs / 60000).toFixed(0)}m of ${MAX_HOLD_MS / 60000}m max). Forward trading continues.`
-          );
-          return false; // owner-requested: keep forward trading while awaiting a favorable exit
+          // Quietly wait — forward trading continues; this is the normal
+          // resting state between cycles, not an exceptional postponement.
+          return false;
         }
         console.log(
           `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: forcing exit at ${exitEdgeBps}bps (${force}).`
@@ -291,7 +283,7 @@ async function cycleBackIfDue(
       }
     }
   }
-  exitPostponements.delete(pairKey);
+
 
   const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, amount, maxSlippageBps, strategy);
   console.log(
@@ -329,7 +321,7 @@ async function runRebalance(user: any, profile: any) {
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
 
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, REBALANCE_CYCLE_LIMIT, "rebalance", profile.maxSlippageBps, amountIn);
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, "rebalance", profile.maxSlippageBps, amountIn);
     if (cycled) continue;
 
     if (!(await hasFunding(user, pair.tokenIn, amountIn))) {
@@ -358,7 +350,7 @@ async function runDca(user: any, profile: any) {
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 10 ** decimalsIn));
 
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, DCA_CYCLE_LIMIT, "dca", profile.maxSlippageBps, amountIn);
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, "dca", profile.maxSlippageBps, amountIn);
     if (cycled) continue;
 
     const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenIn: pair.tokenIn, tokenOut: pair.tokenOut }).sort({

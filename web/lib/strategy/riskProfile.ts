@@ -17,7 +17,7 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: -40, // deliberately NEGATIVE (owner-set): entries fire even below oracle fair value. 47 measured cycles showed entry edge barely predicts realized P&L (r=-0.2, drift during the hold dominates); -40 keeps CELO trading near-continuously while still refusing pathologically bad quotes
+  minProfitBps: 5, // 0.05% net edge floor. A -40bps experiment proved the theory wrong at 1-minute holds: entries at -4..-11bps followed by quick exits were pure spread bleed with no time for drift to help — reverted at the owner's request after live losses
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
   enabledStrategies: ["rebalance"],
