@@ -58,11 +58,15 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
   { tokenIn: "USDm", tokenOut: "CELO" },
 ];
 
-// Exits are no longer count-based (a fixed buys-per-cycle limit forced
-// selling on a schedule regardless of price — at 1-minute holds that was
-// pure spread bleed, observed live). Inventory now exits when the exit
-// quote is favorable, when USDm runs short (immediately, to start the next
-// cycle), or on the bounded force triggers below.
+// Exit design, after two live corrections: a buy count is a MINIMUM
+// accumulation gate, never a trigger. (A count-as-trigger forced selling on
+// a schedule regardless of price — spread bleed; no count at all made one
+// buy "inventory" and exits fired every other tick — churn with no
+// accumulation.) An exit now requires BOTH enough accumulated buys AND a
+// favorable price; only the bounded force triggers below override the
+// price check, and a funding-short replenish overrides everything.
+const REBALANCE_MIN_BUYS = 3; // rebalance: accumulate at least this many buys before considering an exit
+const DCA_MIN_BUYS = 10; // dca: accumulate at least this many buys before considering an exit
 const EXIT_MIN_EDGE_BPS = -10; // take the exit whenever the quote is at least this close to oracle fair
 const MAX_HOLD_MS = 60 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
 const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
@@ -168,6 +172,7 @@ async function cycleBackIfDue(
   user: any,
   tokenIn: TokenSymbol,
   tokenOut: TokenSymbol,
+  minBuys: number,
   strategy: "rebalance" | "dca",
   maxSlippageBps: number,
   neededIn: bigint
@@ -188,10 +193,10 @@ async function cycleBackIfDue(
     args: [TOKENS[tokenIn].address],
   });
   const fundingShort = balanceIn < neededIn;
-  // "Scheduled" now just means there is inventory worth checking an exit
-  // for — the actual go/no-go is the edge check below (take a favorable
-  // exit whenever one exists), not a buy count.
-  const scheduled = !fundingShort && forwardCount > 0;
+  // Enough accumulated buys makes an exit ELIGIBLE; the edge check below
+  // decides whether to actually take it.
+  const scheduled = !fundingShort && forwardCount >= minBuys;
+  if (!fundingShort && !scheduled) return false;
   const trigger = fundingShort ? `replenishing ${tokenIn} (balance below trade size)` : `after ${forwardCount} buys, exit favorable or forced`;
 
   const tokenOutAddress = TOKENS[tokenOut].address;
@@ -321,7 +326,7 @@ async function runRebalance(user: any, profile: any) {
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 10 ** decimalsIn));
 
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, "rebalance", profile.maxSlippageBps, amountIn);
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, REBALANCE_MIN_BUYS, "rebalance", profile.maxSlippageBps, amountIn);
     if (cycled) continue;
 
     if (!(await hasFunding(user, pair.tokenIn, amountIn))) {
@@ -350,7 +355,7 @@ async function runDca(user: any, profile: any) {
     const decimalsIn = TOKENS[pair.tokenIn].decimals;
     const amountIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 10 ** decimalsIn));
 
-    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, "dca", profile.maxSlippageBps, amountIn);
+    const cycled = await cycleBackIfDue(user, pair.tokenIn, pair.tokenOut, DCA_MIN_BUYS, "dca", profile.maxSlippageBps, amountIn);
     if (cycled) continue;
 
     const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "dca", tokenIn: pair.tokenIn, tokenOut: pair.tokenOut }).sort({
