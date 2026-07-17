@@ -62,6 +62,8 @@ const REBALANCE_CYCLE_LIMIT = 3; // forward trades into a currency before swappi
 const DCA_CYCLE_LIMIT = 10; // forward buys before swapping the accumulated balance back
 const EXIT_MIN_EDGE_BPS = -10; // scheduled cycle-backs wait for the exit quote to be at least this close to oracle fair
 const MAX_HOLD_MS = 60 * 60 * 1000; // ...but never hold inventory longer than this waiting for a good exit
+const MAX_EXIT_POSTPONEMENTS = 3; // ...or postpone the same pair's exit more than this many times in a row
+const MAX_EXIT_REVERTS = 3; // ...or keep waiting after this many actual exit attempts reverted since the last settled one
 
 // The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
 // settle a disagreement between API round-trip quotes — which say this
@@ -123,6 +125,11 @@ async function reconcileVaultsFromChain() {
 }
 
 let ticking = false;
+
+// Consecutive postponed scheduled exits per user+pair (in-memory — resets on
+// restart, which is fine: the max-hold clock in TradeLog is the durable
+// backstop).
+const exitPostponements = new Map<string, number>();
 
 /** How many tokenIn->tokenOut trades have settled since the most recent tokenOut->tokenIn (reverse) trade. */
 async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol, tokenOut: TokenSymbol): Promise<number> {
@@ -223,13 +230,34 @@ async function cycleBackIfDue(
   // waiting for an exit that doesn't come. Funding-short replenishes stay
   // unconditional — when USDm is exhausted, restoring tradability beats
   // exit price.
+  const pairKey = `${user._id}:${tokenOut}->${tokenIn}`;
   if (scheduled) {
-    const [bestQuote, refOut] = await Promise.all([
+    // Force the exit through (ignoring the edge floor) when any of these
+    // hold: the max-hold clock ran out, the exit was already postponed
+    // MAX_EXIT_POSTPONEMENTS times, or MAX_EXIT_REVERTS actual reverse
+    // attempts have reverted since the last settled reverse — waiting
+    // longer at that point just accumulates inventory and gas.
+    const [bestQuote, refOut, revertedReverses] = await Promise.all([
       Promise.all([
         getMentoQuote(tokenOut, tokenIn, amount).then((q) => q?.amountOut ?? null).catch(() => null),
         getUniswapQuote(tokenOut, tokenIn, amount).catch(() => null),
       ]).then(([m, u]) => (m !== null && u !== null ? (m > u ? m : u) : m ?? u)),
       getReferenceAmountOut(tokenOut, tokenIn, amount),
+      (async () => {
+        const lastSettledReverse = await TradeLog.findOne({
+          userId: user._id.toString(),
+          tokenIn: tokenOut,
+          tokenOut: tokenIn,
+          status: { $in: ["submitted", "settled"] },
+        }).sort({ createdAt: -1 });
+        return TradeLog.countDocuments({
+          userId: user._id.toString(),
+          tokenIn: tokenOut,
+          tokenOut: tokenIn,
+          status: "reverted",
+          createdAt: { $gt: lastSettledReverse ? lastSettledReverse.createdAt : new Date(0) },
+        });
+      })(),
     ]);
     if (bestQuote !== null && refOut !== null && refOut > 0n) {
       const exitEdgeBps = Number(((bestQuote - refOut) * 10000n) / refOut);
@@ -241,18 +269,29 @@ async function cycleBackIfDue(
           status: { $in: ["submitted", "settled"] },
         }).sort({ createdAt: 1 });
         const heldMs = oldestForward ? Date.now() - oldestForward.createdAt.getTime() : 0;
-        if (heldMs < MAX_HOLD_MS) {
+        const postponed = exitPostponements.get(pairKey) ?? 0;
+        const force =
+          heldMs >= MAX_HOLD_MS
+            ? "max hold reached"
+            : postponed >= MAX_EXIT_POSTPONEMENTS
+              ? `${postponed} postponements used up`
+              : revertedReverses >= MAX_EXIT_REVERTS
+                ? `${revertedReverses} reverted exit attempts`
+                : null;
+        if (!force) {
+          exitPostponements.set(pairKey, postponed + 1);
           console.log(
-            `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: postponed — exit edge ${exitEdgeBps}bps < ${EXIT_MIN_EDGE_BPS}bps floor (held ${(heldMs / 60000).toFixed(0)}m of ${MAX_HOLD_MS / 60000}m max).`
+            `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: postponed (${postponed + 1}/${MAX_EXIT_POSTPONEMENTS}) — exit edge ${exitEdgeBps}bps < ${EXIT_MIN_EDGE_BPS}bps floor (held ${(heldMs / 60000).toFixed(0)}m of ${MAX_HOLD_MS / 60000}m max). Forward trading continues.`
           );
-          return true; // pause forward trades for this pair too — don't grow inventory while waiting to exit
+          return false; // owner-requested: keep forward trading while awaiting a favorable exit
         }
         console.log(
-          `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: max hold reached — exiting at ${exitEdgeBps}bps despite the floor.`
+          `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: forcing exit at ${exitEdgeBps}bps (${force}).`
         );
       }
     }
   }
+  exitPostponements.delete(pairKey);
 
   const result = await executeDca(user.vaultAddress, user._id.toString(), tokenOut, tokenIn, amount, maxSlippageBps, strategy);
   console.log(
