@@ -603,7 +603,7 @@ export default function Dashboard() {
                   <label htmlFor="strategy">Strategy</label>
                   <select id="strategy" value={strategy} onChange={(e) => setStrategy(e.target.value as "rebalance" | "dca" | "arbitrage")}>
                     <option value="rebalance">Rebalance — trade only when it clears your profit margin</option>
-                    <option value="dca">DCA — buy 1 USDm worth of CELO + G$ every minute, regardless of price</option>
+                    <option value="dca">DCA — buy 2 USDm worth of CELO every minute, regardless of price</option>
                     <option value="arbitrage">Arbitrage (experiment) — buy CELO on Squid, sell on Uniswap, 1 USDm every 30 minutes</option>
                   </select>
                 </div>
