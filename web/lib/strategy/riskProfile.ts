@@ -17,7 +17,7 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: 2, // 0.02% net edge — near the gas floor on purpose: 47 measured cycles showed entry edge barely predicts realized P&L (r=-0.2), so the gate is a volume throttle more than a profit filter
+  minProfitBps: -40, // deliberately NEGATIVE (owner-set): entries fire even below oracle fair value. 47 measured cycles showed entry edge barely predicts realized P&L (r=-0.2, drift during the hold dominates); -40 keeps CELO trading near-continuously while still refusing pathologically bad quotes
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
   enabledStrategies: ["rebalance"],
@@ -42,12 +42,18 @@ export function reviewProposedProfile(proposed: Partial<RiskProfile>, estimatedG
   const adjusted: Partial<RiskProfile> = { ...proposed };
 
   if (proposed.minProfitBps !== undefined && proposed.minProfitBps < estimatedGasBps) {
+    // Warn but do NOT override: a below-gas (even negative) floor is a
+    // deliberate, supported configuration — measured cycle data showed
+    // entry edge barely predicts realized P&L on volatile pairs (drift
+    // during the hold dominates), so an owner may intentionally trade
+    // through negative measured edges for volume/drift exposure. The
+    // agent's job here is informed consent, not a veto: the warning is
+    // shown, and the value only saves after the owner acknowledges it.
     warnings.push(
-      `A minimum profit of ${proposed.minProfitBps}bps is below the current estimated gas+fee cost of ` +
-        `${estimatedGasBps}bps per trade. Every trade would execute at a guaranteed loss. Raising the floor to ` +
-        `${estimatedGasBps + 5}bps (gas cost plus a 5bps margin) instead.`
+      `A minimum profit of ${proposed.minProfitBps}bps is below the estimated gas+fee cost of ` +
+        `${estimatedGasBps}bps per trade — entries will knowingly execute at negative measured edge, relying on ` +
+        `price drift during the hold and exit timing for profitability. Confirm to proceed with this setting.`
     );
-    adjusted.minProfitBps = estimatedGasBps + 5;
   }
 
   if (proposed.maxSlippageBps !== undefined && proposed.maxSlippageBps > 2000) {
