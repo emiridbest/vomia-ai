@@ -31,7 +31,7 @@ import { buildUniswapSwapCalldata, getBestUniswapQuote, getUniswapQuote, UNISWAP
 import { getSquidSameChainRoute } from "../dex/squidSameChain";
 import { TOKENS, type TokenSymbol } from "../tokens";
 import type { ScanResult } from "./spreadScanner";
-import { TradeLog } from "../db/models";
+import { accrueFee, TradeLog } from "../db/models";
 import { attachAttributionTag } from "../attribution";
 
 const AGENT_VAULT_EXECUTE_ABI = [
@@ -149,6 +149,7 @@ async function sendTaggedSwap(params: {
     if (status === "reverted") {
       return { status: "reverted", txHash, actionId, reason: "Transaction mined but reverted on-chain — see the tx on Celoscan for the revert reason." };
     }
+    await accrueFee(params.userId, "trade");
     return { status: "settled", txHash, actionId, reason: params.reasonOnSuccess };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

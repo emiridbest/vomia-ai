@@ -36,7 +36,7 @@
 import { createPublicClient, http, type Address } from "viem";
 import { celo } from "viem/chains";
 import { connectDB } from "../lib/db/connection";
-import { User, RiskProfile, TradeLog } from "../lib/db/models";
+import { accrueFee, User, RiskProfile, TradeLog } from "../lib/db/models";
 import { scanPair } from "../lib/strategy/spreadScanner";
 import { getMentoQuote } from "../lib/dex/mento";
 import { getUniswapQuote } from "../lib/dex/uniswap";
@@ -261,6 +261,7 @@ async function cycleBackIfDue(
         });
       })(),
     ]);
+    await accrueFee(user._id.toString(), "check"); // exit-eligibility check quotes venues + oracle
     if (bestQuote !== null && refOut !== null && refOut > 0n) {
       const exitEdgeBps = Number(((bestQuote - refOut) * 10000n) / refOut);
       if (exitEdgeBps < EXIT_MIN_EDGE_BPS) {
@@ -335,6 +336,7 @@ async function runRebalance(user: any, profile: any) {
     }
 
     const scan = await scanPair(pair.tokenIn, pair.tokenOut, amountIn, SCAN_AMOUNT_HUMAN, profile);
+    await accrueFee(user._id.toString(), "check");
 
     if (scan.decision === "execute") {
       const result = await executeIfProfitable(user.vaultAddress, user._id.toString(), scan, profile.maxSlippageBps);
@@ -368,6 +370,7 @@ async function runDca(user: any, profile: any) {
       continue;
     }
 
+    await accrueFee(user._id.toString(), "check"); // the buy itself quotes every venue
     const result = await executeDca(user.vaultAddress, user._id.toString(), pair.tokenIn, pair.tokenOut, amountIn, profile.maxSlippageBps);
     console.log(
       `[${user.walletAddress.slice(0, 8)}] dca ${pair.tokenIn}->${pair.tokenOut}: ${result.status}` +

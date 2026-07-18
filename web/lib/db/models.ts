@@ -123,6 +123,34 @@ const TradeLogSchema = new Schema<TradeLogDoc>(
   { timestamps: { createdAt: true, updatedAt: false } }
 );
 
+// ---------------------------------------------------------------------
+// FeeAccrual — metered service fees, one document per user per UTC day.
+// The agent can never pull these from the vault (owner-only withdrawals,
+// by design) — this ledger is what the user owes for the agent's work
+// (route lookups, oracle reads, executed trades), settled out-of-band via
+// x402 after the free-trial window. During the trial the dashboard shows
+// the accrued amount as waived.
+// ---------------------------------------------------------------------
+export interface FeeAccrualDoc {
+  userId: mongoose.Types.ObjectId;
+  day: string; // UTC date, "YYYY-MM-DD"
+  checks: number; // scan/oracle/route lookups performed
+  trades: number; // executed (settled) trades
+  usdcOwed: number; // accrued fee total for the day, in USDC
+}
+
+const FeeAccrualSchema = new Schema<FeeAccrualDoc>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "VomiaUser", required: true, index: true },
+    day: { type: String, required: true },
+    checks: { type: Number, default: 0 },
+    trades: { type: Number, default: 0 },
+    usdcOwed: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+FeeAccrualSchema.index({ userId: 1, day: 1 }, { unique: true });
+
 // Model + collection names are prefixed "Vomia"/"vomia_" on purpose: MONGODB_URI
 // points at a shared cluster with no database name in the connection string
 // (so it lands in that cluster's default database), and generic names like
@@ -132,3 +160,25 @@ export const RiskProfile =
   models.VomiaRiskProfile || model<RiskProfileDoc>("VomiaRiskProfile", RiskProfileSchema, "vomia_risk_profiles");
 export const TradeLog =
   models.VomiaTradeLog || model<TradeLogDoc>("VomiaTradeLog", TradeLogSchema, "vomia_trade_logs");
+export const FeeAccrual =
+  models.VomiaFeeAccrual || model<FeeAccrualDoc>("VomiaFeeAccrual", FeeAccrualSchema, "vomia_fee_accruals");
+
+/** Fee schedule (USDC). Per-CHECK pricing on purpose: the agent's costs
+ * (RPC, oracle reads, route quotes) accrue whether or not a trade fires. */
+export const FEE_PER_CHECK_USDC = 0.001;
+export const FEE_PER_TRADE_USDC = 0.01;
+
+/** Meter a fee event. Fire-and-forget safe: billing must never break trading. */
+export async function accrueFee(userId: string, kind: "check" | "trade", count = 1): Promise<void> {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const usdc = (kind === "check" ? FEE_PER_CHECK_USDC : FEE_PER_TRADE_USDC) * count;
+    await FeeAccrual.updateOne(
+      { userId, day },
+      { $inc: { [kind === "check" ? "checks" : "trades"]: count, usdcOwed: usdc } },
+      { upsert: true }
+    );
+  } catch {
+    // never let fee metering interfere with trading
+  }
+}

@@ -120,6 +120,7 @@ export default function Dashboard() {
   const [balances, setBalances] = useState<Partial<Record<TokenSymbol, string>>>({});
   const [copied, setCopied] = useState(false);
 
+  const [fees, setFees] = useState<{ checks: number; trades: number; usdcOwed: number } | null>(null);
   const [depositToken, setDepositToken] = useState<TokenSymbol>("USDm");
   const [depositAmount, setDepositAmount] = useState("");
   const [depositStatus, setDepositStatus] = useState<string | null>(null);
@@ -185,6 +186,20 @@ export default function Dashboard() {
   useEffect(() => {
     syncVaultToDb();
   }, [syncVaultToDb]);
+
+  // Metered service fees (per-check + per-trade), shown as waived during
+  // the trial. Transparency only — nothing here moves money.
+  useEffect(() => {
+    if (!address) return;
+    const load = () =>
+      fetch(`/api/fees?walletAddress=${address}`)
+        .then((res) => res.json())
+        .then((data) => setFees({ checks: data.checks ?? 0, trades: data.trades ?? 0, usdcOwed: data.usdcOwed ?? 0 }))
+        .catch(() => {});
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
+  }, [address]);
 
   // Load whatever risk profile (including strategy choice) is already
   // saved, so the form reflects reality instead of always resetting to
@@ -529,6 +544,20 @@ export default function Dashboard() {
                   <li key={symbol}>{symbol === "GOOD_DOLLAR" ? "G$" : symbol}: {balances[symbol] ?? "…"}</li>
                 ))}
               </ul>
+
+              {fees && (
+                <div style={{ marginTop: 16, padding: "10px 12px", border: "1px solid var(--cream-dim)", borderRadius: 8 }}>
+                  <p style={{ fontSize: "0.8rem", margin: 0 }}>
+                    <strong>Service fees — 2-week free trial, fully waived.</strong>
+                  </p>
+                  <p style={{ fontSize: "0.78rem", color: "var(--cream-dim)", margin: "4px 0 0" }}>
+                    The agent has performed {fees.checks.toLocaleString()} route/oracle checks and {fees.trades.toLocaleString()} executed
+                    trades for this vault — {"$" + fees.usdcOwed.toFixed(2)} USDC at the standard rates ($0.001/check, $0.01/trade),
+                    all waived during the trial. After the trial, fees settle gaslessly in USDC via x402 — never from your vault, which
+                    the agent cannot withdraw from.
+                  </p>
+                </div>
+              )}
 
               <h4 style={{ marginTop: 16, fontSize: "0.85rem" }}>Fund your vault</h4>
               <p style={{ color: "var(--cream-dim)", fontSize: "0.8rem", marginBottom: 8 }}>
