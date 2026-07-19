@@ -130,6 +130,22 @@ async function reconcileVaultsFromChain() {
   }
 }
 
+// Dogfood the product's own paid API surface: each internal check also
+// pings the deployed x402 check endpoint as an ordinary client. Sent
+// UNPAID on purpose — the endpoint answers with its 402 payment challenge
+// and nothing settles, so this counts for nothing on any leaderboard; it
+// exercises the real request path the trial's metered fees will settle
+// through later. Strictly fire-and-forget: short timeout, every error
+// swallowed, never awaited by trading logic.
+const X402_CHECK_URL = process.env.VOMIA_X402_CHECK_URL || "https://vomiaagent.vercel.app/api/x402/check";
+function pingX402Check(tokenIn: string, tokenOut: string, amountIn: number): void {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  fetch(`${X402_CHECK_URL}?tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`, { signal: controller.signal })
+    .catch(() => {})
+    .finally(() => clearTimeout(timer));
+}
+
 let ticking = false;
 
 
@@ -262,6 +278,7 @@ async function cycleBackIfDue(
       })(),
     ]);
     await accrueFee(user._id.toString(), "check"); // exit-eligibility check quotes venues + oracle
+    pingX402Check(tokenOut, tokenIn, Number(amount / 10n ** 18n));
     if (bestQuote !== null && refOut !== null && refOut > 0n) {
       const exitEdgeBps = Number(((bestQuote - refOut) * 10000n) / refOut);
       if (exitEdgeBps < EXIT_MIN_EDGE_BPS) {
@@ -337,6 +354,7 @@ async function runRebalance(user: any, profile: any) {
 
     const scan = await scanPair(pair.tokenIn, pair.tokenOut, amountIn, SCAN_AMOUNT_HUMAN, profile);
     await accrueFee(user._id.toString(), "check");
+    pingX402Check(pair.tokenIn, pair.tokenOut, SCAN_AMOUNT_HUMAN);
 
     if (scan.decision === "execute") {
       const result = await executeIfProfitable(user.vaultAddress, user._id.toString(), scan, profile.maxSlippageBps);
@@ -371,6 +389,7 @@ async function runDca(user: any, profile: any) {
     }
 
     await accrueFee(user._id.toString(), "check"); // the buy itself quotes every venue
+    pingX402Check(pair.tokenIn, pair.tokenOut, DCA_AMOUNT_HUMAN);
     const result = await executeDca(user.vaultAddress, user._id.toString(), pair.tokenIn, pair.tokenOut, amountIn, profile.maxSlippageBps);
     console.log(
       `[${user.walletAddress.slice(0, 8)}] dca ${pair.tokenIn}->${pair.tokenOut}: ${result.status}` +
