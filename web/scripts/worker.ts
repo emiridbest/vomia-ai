@@ -67,7 +67,8 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 // price check, and a funding-short replenish overrides everything.
 const REBALANCE_MIN_BUYS = 3; // rebalance: accumulate at least this many buys before considering an exit
 const DCA_MIN_BUYS = 10; // dca: accumulate at least this many buys before considering an exit
-const EXIT_MIN_EDGE_BPS = -10; // take the exit whenever the quote is at least this close to oracle fair
+const PROFIT_TARGET_BPS = 10; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
+const REFILL_TRADES = 5; // funding-short exits sell only enough inventory to fund about this many forward trades
 const MAX_HOLD_MS = 60 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
 const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
 
@@ -150,8 +151,13 @@ let ticking = false;
 
 
 
-/** How many tokenIn->tokenOut trades have settled since the most recent tokenOut->tokenIn (reverse) trade. */
-async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol, tokenOut: TokenSymbol): Promise<number> {
+/** Buys since the most recent reverse trade: how many, their total tokenIn
+ * spend (the inventory's cost basis, raw units), and the oldest buy's age. */
+async function forwardsSinceLastReverse(
+  userId: string,
+  tokenIn: TokenSymbol,
+  tokenOut: TokenSymbol
+): Promise<{ count: number; totalIn: bigint; oldestAt: Date | null }> {
   const lastReverse = await TradeLog.findOne({
     userId,
     tokenIn: tokenOut,
@@ -159,13 +165,16 @@ async function forwardCountSinceLastReverse(userId: string, tokenIn: TokenSymbol
     status: { $in: ["submitted", "settled"] },
   }).sort({ createdAt: -1 });
   const since = lastReverse ? lastReverse.createdAt : new Date(0);
-  return TradeLog.countDocuments({
+  const forwards = await TradeLog.find({
     userId,
     tokenIn,
     tokenOut,
     status: { $in: ["submitted", "settled"] },
     createdAt: { $gt: since },
-  });
+  }).sort({ createdAt: 1 }).lean();
+  let totalIn = 0n;
+  for (const f of forwards) totalIn += BigInt(f.amountIn);
+  return { count: forwards.length, totalIn, oldestAt: forwards.length ? forwards[0].createdAt : null };
 }
 
 /**
@@ -201,7 +210,7 @@ async function cycleBackIfDue(
   // in KESm/NGNm/EURm, and every 10-USDm attempt reverted with
   // "SafeERC20: low-level call failed" until a scheduled cycle-back
   // happened to come around).
-  const forwardCount = await forwardCountSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
+  const { count: forwardCount, totalIn: costBasis, oldestAt } = await forwardsSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
   const balanceIn = await publicClient.readContract({
     address: user.vaultAddress as Address,
     abi: VAULT_BALANCE_ABI,
@@ -239,28 +248,18 @@ async function cycleBackIfDue(
     return false;
   }
 
-  // Edge-aware exit (scheduled cycle-backs only): entries average ~+15bps
-  // of genuine edge, but unconditionally selling into a ~-30bps exit
-  // spread gave all of it back — the one leak that kept realized CELO P&L
-  // slightly negative. So a scheduled exit now waits for the reverse quote
-  // to be within EXIT_MIN_EDGE_BPS of oracle fair value, checked each
-  // tick, with a hard time cap (MAX_HOLD_MS since the oldest unreversed
-  // buy) so inventory can never sit in a volatile asset indefinitely
-  // waiting for an exit that doesn't come. Funding-short replenishes stay
-  // unconditional — when USDm is exhausted, restoring tradability beats
-  // exit price.
+  // Cost-basis exit (owner-requested): a voluntary exit must return MORE
+  // USDm than the inventory actually cost, plus PROFIT_TARGET_BPS — a
+  // take-profit against the position's own entry prices, not against the
+  // oracle. The force triggers (max hold, repeated reverted exits) still
+  // override so a falling market can't trap capital forever; those exits
+  // can realize losses, which is the accepted price of never being stuck.
   if (scheduled) {
-    // Force the exit through (ignoring the edge floor) when any of these
-    // hold: the max-hold clock ran out, the exit was already postponed
-    // MAX_EXIT_POSTPONEMENTS times, or MAX_EXIT_REVERTS actual reverse
-    // attempts have reverted since the last settled reverse — waiting
-    // longer at that point just accumulates inventory and gas.
-    const [bestQuote, refOut, revertedReverses] = await Promise.all([
+    const [bestQuote, revertedReverses] = await Promise.all([
       Promise.all([
         getMentoQuote(tokenOut, tokenIn, amount).then((q) => q?.amountOut ?? null).catch(() => null),
         getUniswapQuote(tokenOut, tokenIn, amount).catch(() => null),
       ]).then(([m, u]) => (m !== null && u !== null ? (m > u ? m : u) : m ?? u)),
-      getReferenceAmountOut(tokenOut, tokenIn, amount),
       (async () => {
         const lastSettledReverse = await TradeLog.findOne({
           userId: user._id.toString(),
@@ -277,32 +276,47 @@ async function cycleBackIfDue(
         });
       })(),
     ]);
-    await accrueFee(user._id.toString(), "check"); // exit-eligibility check quotes venues + oracle
+    await accrueFee(user._id.toString(), "check"); // exit-eligibility check quotes venues
     pingX402Check(tokenOut, tokenIn, Number(amount / 10n ** 18n));
-    if (bestQuote !== null && refOut !== null && refOut > 0n) {
-      const exitEdgeBps = Number(((bestQuote - refOut) * 10000n) / refOut);
-      if (exitEdgeBps < EXIT_MIN_EDGE_BPS) {
-        const oldestForward = await TradeLog.findOne({
-          userId: user._id.toString(),
-          tokenIn,
-          tokenOut,
-          status: { $in: ["submitted", "settled"] },
-        }).sort({ createdAt: 1 });
-        const heldMs = oldestForward ? Date.now() - oldestForward.createdAt.getTime() : 0;
-        const force =
-          heldMs >= MAX_HOLD_MS
-            ? "max hold reached"
-            : revertedReverses >= MAX_EXIT_REVERTS
-              ? `${revertedReverses} reverted exit attempts`
-              : null;
-        if (!force) {
-          // Quietly wait — forward trading continues; this is the normal
-          // resting state between cycles, not an exceptional postponement.
-          return false;
-        }
-        console.log(
-          `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: forcing exit at ${exitEdgeBps}bps (${force}).`
-        );
+
+    // Selling a clamped portion of the inventory only needs to beat the
+    // same portion of the cost basis.
+    const basisForAmount = balance > 0n ? (costBasis * amount) / balance : costBasis;
+    const target = basisForAmount + (basisForAmount * BigInt(PROFIT_TARGET_BPS)) / 10000n;
+    if (bestQuote === null || bestQuote < target) {
+      const heldMs = oldestAt ? Date.now() - oldestAt.getTime() : 0;
+      const force =
+        heldMs >= MAX_HOLD_MS
+          ? "max hold reached"
+          : revertedReverses >= MAX_EXIT_REVERTS
+            ? `${revertedReverses} reverted exit attempts`
+            : null;
+      if (!force) {
+        // Quietly wait — forward trading continues; this is the normal
+        // resting state between cycles, not an exceptional postponement.
+        return false;
+      }
+      console.log(
+        `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: forcing exit below cost basis (quote ${bestQuote ?? "n/a"} < target ${target}) — ${force}.`
+      );
+    } else {
+      const profitBps = basisForAmount > 0n ? Number(((bestQuote - basisForAmount) * 10000n) / basisForAmount) : 0;
+      console.log(
+        `[${user.walletAddress.slice(0, 8)}] ${strategy}-cycle-back ${tokenOut}->${tokenIn}: taking profit — quote beats cost basis by ${profitBps}bps.`
+      );
+    }
+  } else if (fundingShort) {
+    // Partial replenish: sell only enough inventory to fund ~REFILL_TRADES
+    // more forward trades instead of dumping the whole position at
+    // whatever the current price is — the rest keeps waiting for its
+    // profit target.
+    const refFull = await getReferenceAmountOut(tokenOut, tokenIn, balance);
+    if (refFull !== null && refFull > 0n) {
+      const wantIn = neededIn * BigInt(REFILL_TRADES);
+      if (wantIn < refFull) {
+        let partial = (balance * wantIn) / refFull;
+        if (partial === 0n) partial = balance;
+        if (partial < amount) amount = partial;
       }
     }
   }
