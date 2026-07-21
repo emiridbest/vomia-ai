@@ -42,9 +42,18 @@ import { getMentoQuote } from "../lib/dex/mento";
 import { getUniswapQuote } from "../lib/dex/uniswap";
 import { getReferenceAmountOut } from "../lib/dex/oracle";
 import { executeIfProfitable, executeDca, executeVenueSwap } from "../lib/strategy/executor";
+import { ensureOperatorUser, executeDirectSwap, operatorTokenBalance } from "../lib/strategy/directTrader";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
 import { rpcUrl } from "../lib/chains";
+
+// Operator-wallet DIRECT trading. Vault-mediated trades score ZERO Track 1
+// tagged volume (a contract is never tx_from), so when this is on the worker
+// trades the operator EOA's own USDm/CELO directly (tag on the tx tail,
+// tx_from == token sender) and skips the per-vault loops entirely to conserve
+// gas. Fund the operator wallet with USDm to trade + CELO for gas.
+const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
+const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
@@ -459,6 +468,71 @@ async function runArbitrage(user: any, profile: any) {
   }
 }
 
+const DIRECT_PROFILE = { minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 1_000_000, enabledStrategies: ["rebalance"] as ("rebalance" | "arbitrage" | "remittance" | "dca")[] };
+
+/**
+ * Trade the operator EOA's own balance directly (USDm<->CELO), so the tx
+ * scores Track 1 tagged volume. One action per tick (exit > rebalance entry >
+ * DCA), each awaiting its receipt, to keep nonces serial. Always leaves
+ * GAS_RESERVE_CELO untouched for gas.
+ */
+async function runDirectTrading() {
+  const { id: uid, address } = await ensureOperatorUser();
+  const tag = `[direct ${address.slice(0, 8)}]`;
+  const tradeIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 1e18));
+  const dcaIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 1e18));
+
+  const [usdm, celoBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance("CELO")]);
+
+  // ---- EXIT: cost-basis sell of CELO inventory, reserving gas ----
+  const sellable = celoBal > GAS_RESERVE_CELO ? celoBal - GAS_RESERVE_CELO : 0n;
+  const { count, totalIn: costBasis, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", "CELO");
+  if (sellable > 0n && count >= REBALANCE_MIN_BUYS) {
+    const [m, u] = await Promise.all([
+      getMentoQuote("CELO", "USDm", sellable).then((q) => q?.amountOut ?? null).catch(() => null),
+      getUniswapQuote("CELO", "USDm", sellable).catch(() => null),
+    ]);
+    const bestQuote = m !== null && u !== null ? (m > u ? m : u) : (m ?? u);
+    await accrueFee(uid, "check");
+    pingX402Check("CELO", "USDm", Number(sellable / 10n ** 18n));
+    const basisPortion = celoBal > 0n ? (costBasis * sellable) / celoBal : costBasis;
+    const target = basisPortion + (basisPortion * BigInt(PROFIT_TARGET_BPS)) / 10000n;
+    const heldMs = oldestAt ? Date.now() - oldestAt.getTime() : 0;
+    const takeProfit = bestQuote !== null && bestQuote >= target;
+    if (takeProfit || heldMs >= MAX_HOLD_MS) {
+      const res = await executeDirectSwap(uid, "CELO", "USDm", sellable, DIRECT_PROFILE.maxSlippageBps, "rebalance");
+      console.log(`${tag} exit CELO->USDm (${takeProfit ? "take-profit" : "max-hold"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+      return;
+    }
+  }
+
+  // ---- ENTRY: rebalance (edge-gated) ----
+  if (usdm >= tradeIn) {
+    const scan = await scanPair("USDm", "CELO", tradeIn, SCAN_AMOUNT_HUMAN, DIRECT_PROFILE);
+    await accrueFee(uid, "check");
+    pingX402Check("USDm", "CELO", SCAN_AMOUNT_HUMAN);
+    if (scan.decision === "execute") {
+      const res = await executeDirectSwap(uid, "USDm", "CELO", tradeIn, DIRECT_PROFILE.maxSlippageBps, "rebalance");
+      console.log(`${tag} rebalance USDm->CELO (edge ${scan.netEdgeBps}bps): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+      return;
+    }
+    console.log(`${tag} rebalance USDm->CELO: ${scan.decision} (${scan.reason})`);
+  } else {
+    console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${SCAN_AMOUNT_HUMAN} — awaiting an exit to replenish.`);
+  }
+
+  // ---- DCA: timed, unconditional ----
+  if (usdm >= dcaIn) {
+    const lastDca = await TradeLog.findOne({ userId: uid, strategy: "dca", tokenOut: "CELO", status: { $in: ["submitted", "settled"] } }).sort({ createdAt: -1 });
+    if (!lastDca || Date.now() - lastDca.createdAt.getTime() >= DCA_INTERVAL_MS) {
+      await accrueFee(uid, "check");
+      pingX402Check("USDm", "CELO", DCA_AMOUNT_HUMAN);
+      const res = await executeDirectSwap(uid, "USDm", "CELO", dcaIn, DIRECT_PROFILE.maxSlippageBps, "dca");
+      console.log(`${tag} dca USDm->CELO: ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+    }
+  }
+}
+
 async function tick() {
   if (ticking) return; // never let a slow tick overlap the next one
   ticking = true;
@@ -466,6 +540,10 @@ async function tick() {
 
   try {
     await connectDB();
+    if (OPERATOR_DIRECT_TRADING) {
+      await runDirectTrading();
+      return;
+    }
     await reconcileVaultsFromChain();
     const users = await User.find({ vaultAddress: { $exists: true, $ne: null } });
     console.log(`Found ${users.length} user(s) with a vault.`);
