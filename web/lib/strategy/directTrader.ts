@@ -90,7 +90,15 @@ async function ensureAllowance(token: Address, spender: Address, amount: bigint)
 /** The one operator "user" row (walletAddress = operator, no vaultAddress) — gives direct-trade logs a real userId. */
 export async function ensureOperatorUser(): Promise<{ id: string; address: Address }> {
   const address = operatorAddress();
-  const user = await User.findOneAndUpdate({ walletAddress: address }, { walletAddress: address }, { upsert: true, new: true });
+  // Explicitly $unset vaultAddress: the operator EOA is a trader, never a
+  // vault. If it ever carries a vaultAddress, the per-vault loop tries to
+  // read tokenBalance() on an EOA (not a contract) and throws, which
+  // previously killed the whole tick.
+  const user = await User.findOneAndUpdate(
+    { walletAddress: address },
+    { $set: { walletAddress: address }, $unset: { vaultAddress: "" } },
+    { upsert: true, new: true }
+  );
   return { id: user._id.toString(), address };
 }
 

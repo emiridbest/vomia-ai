@@ -549,32 +549,39 @@ async function tick() {
     console.log(`Found ${users.length} user(s) with a vault.`);
 
     for (const user of users) {
-      const profile = (await RiskProfile.findOne({ userId: user._id })) ?? DEFAULT_RISK_PROFILE;
-      if ((profile as any).paused) {
-        console.log(`[${user.walletAddress.slice(0, 8)}] skipped: risk profile is paused.`);
-        continue;
+      // Per-user isolation: a single bad user row (e.g. a non-contract
+      // vaultAddress that makes tokenBalance() throw) must never abort the
+      // whole tick and halt everyone else's trading, as it once did.
+      try {
+        const profile = (await RiskProfile.findOne({ userId: user._id })) ?? DEFAULT_RISK_PROFILE;
+        if ((profile as any).paused) {
+          console.log(`[${user.walletAddress.slice(0, 8)}] skipped: risk profile is paused.`);
+          continue;
+        }
+
+        const strategies: string[] = profile.enabledStrategies?.length ? profile.enabledStrategies : DEFAULT_RISK_PROFILE.enabledStrategies;
+
+        // Self-enforced daily trade budget (the vault separately enforces
+        // token-unit caps on-chain; this one is about count), shared across
+        // whichever strategies this user has enabled.
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const tradesToday = await TradeLog.countDocuments({
+          userId: user._id,
+          status: { $in: ["submitted", "settled"] },
+          createdAt: { $gte: since },
+        });
+        if (tradesToday >= profile.maxTradesPerDay) {
+          console.log(`[${user.walletAddress.slice(0, 8)}] skipped: hit daily trade cap (${tradesToday}/${profile.maxTradesPerDay}).`);
+          continue;
+        }
+
+        console.log(`[${user.walletAddress.slice(0, 8)}] strategies: ${strategies.join(", ")}`);
+        if (strategies.includes("rebalance")) await runRebalance(user, profile);
+        if (strategies.includes("dca")) await runDca(user, profile);
+        if (strategies.includes("arbitrage")) await runArbitrage(user, profile);
+      } catch (userErr) {
+        console.error(`[${user.walletAddress.slice(0, 8)}] tick error (skipped, other users continue):`, userErr instanceof Error ? userErr.message : userErr);
       }
-
-      const strategies: string[] = profile.enabledStrategies?.length ? profile.enabledStrategies : DEFAULT_RISK_PROFILE.enabledStrategies;
-
-      // Self-enforced daily trade budget (the vault separately enforces
-      // token-unit caps on-chain; this one is about count), shared across
-      // whichever strategies this user has enabled.
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const tradesToday = await TradeLog.countDocuments({
-        userId: user._id,
-        status: { $in: ["submitted", "settled"] },
-        createdAt: { $gte: since },
-      });
-      if (tradesToday >= profile.maxTradesPerDay) {
-        console.log(`[${user.walletAddress.slice(0, 8)}] skipped: hit daily trade cap (${tradesToday}/${profile.maxTradesPerDay}).`);
-        continue;
-      }
-
-      console.log(`[${user.walletAddress.slice(0, 8)}] strategies: ${strategies.join(", ")}`);
-      if (strategies.includes("rebalance")) await runRebalance(user, profile);
-      if (strategies.includes("dca")) await runDca(user, profile);
-      if (strategies.includes("arbitrage")) await runArbitrage(user, profile);
     }
   } catch (err) {
     console.error("Worker tick failed:", err instanceof Error ? err.message : err);
