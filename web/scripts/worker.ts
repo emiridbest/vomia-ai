@@ -54,6 +54,8 @@ import { rpcUrl } from "../lib/chains";
 // gas. Fund the operator wallet with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
+const DIRECT_TRADE_USDM = 50; // owner-set: operator rebalance buy size, in USDm
+const DIRECT_MIN_BUYS = 1; // consider an exit after even one buy so a +10bps pop sells immediately
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
@@ -479,15 +481,17 @@ const DIRECT_PROFILE = { minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 
 async function runDirectTrading() {
   const { id: uid, address } = await ensureOperatorUser();
   const tag = `[direct ${address.slice(0, 8)}]`;
-  const tradeIn = BigInt(Math.floor(SCAN_AMOUNT_HUMAN * 1e18));
-  const dcaIn = BigInt(Math.floor(DCA_AMOUNT_HUMAN * 1e18));
+  const tradeIn = BigInt(Math.floor(DIRECT_TRADE_USDM * 1e18)); // owner-set: 50 USDm rebalance buys
 
   const [usdm, celoBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance("CELO")]);
 
-  // ---- EXIT: cost-basis sell of CELO inventory, reserving gas ----
+  // ---- EXIT: sell CELO inventory for cost basis + PROFIT_TARGET_BPS (10),
+  // reserving 1 CELO for gas. Considered after even a single buy
+  // (DIRECT_MIN_BUYS = 1) so a position that pops +10bps sells immediately;
+  // otherwise force-recycled at MAX_HOLD_MS (20 min). ----
   const sellable = celoBal > GAS_RESERVE_CELO ? celoBal - GAS_RESERVE_CELO : 0n;
   const { count, totalIn: costBasis, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", "CELO");
-  if (sellable > 0n && count >= REBALANCE_MIN_BUYS) {
+  if (sellable > 0n && count >= DIRECT_MIN_BUYS) {
     const [m, u] = await Promise.all([
       getMentoQuote("CELO", "USDm", sellable).then((q) => q?.amountOut ?? null).catch(() => null),
       getUniswapQuote("CELO", "USDm", sellable).catch(() => null),
@@ -501,35 +505,24 @@ async function runDirectTrading() {
     const takeProfit = bestQuote !== null && bestQuote >= target;
     if (takeProfit || heldMs >= MAX_HOLD_MS) {
       const res = await executeDirectSwap(uid, "CELO", "USDm", sellable, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-      console.log(`${tag} exit CELO->USDm (${takeProfit ? "take-profit" : "max-hold"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+      console.log(`${tag} exit CELO->USDm (${takeProfit ? "take-profit +10bps" : "20min recycle"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
       return;
     }
   }
 
-  // ---- ENTRY: rebalance (edge-gated) ----
+  // ---- ENTRY: rebalance, 50 USDm, edge-gated ----
   if (usdm >= tradeIn) {
-    const scan = await scanPair("USDm", "CELO", tradeIn, SCAN_AMOUNT_HUMAN, DIRECT_PROFILE);
+    const scan = await scanPair("USDm", "CELO", tradeIn, DIRECT_TRADE_USDM, DIRECT_PROFILE);
     await accrueFee(uid, "check");
-    pingX402Check("USDm", "CELO", SCAN_AMOUNT_HUMAN);
+    pingX402Check("USDm", "CELO", DIRECT_TRADE_USDM);
     if (scan.decision === "execute") {
       const res = await executeDirectSwap(uid, "USDm", "CELO", tradeIn, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-      console.log(`${tag} rebalance USDm->CELO (edge ${scan.netEdgeBps}bps): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+      console.log(`${tag} rebalance USDm->CELO 50 (edge ${scan.netEdgeBps}bps): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
       return;
     }
     console.log(`${tag} rebalance USDm->CELO: ${scan.decision} (${scan.reason})`);
   } else {
-    console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${SCAN_AMOUNT_HUMAN} — awaiting an exit to replenish.`);
-  }
-
-  // ---- DCA: timed, unconditional ----
-  if (usdm >= dcaIn) {
-    const lastDca = await TradeLog.findOne({ userId: uid, strategy: "dca", tokenOut: "CELO", status: { $in: ["submitted", "settled"] } }).sort({ createdAt: -1 });
-    if (!lastDca || Date.now() - lastDca.createdAt.getTime() >= DCA_INTERVAL_MS) {
-      await accrueFee(uid, "check");
-      pingX402Check("USDm", "CELO", DCA_AMOUNT_HUMAN);
-      const res = await executeDirectSwap(uid, "USDm", "CELO", dcaIn, DIRECT_PROFILE.maxSlippageBps, "dca");
-      console.log(`${tag} dca USDm->CELO: ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
-    }
+    console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${DIRECT_TRADE_USDM} — awaiting an exit to replenish.`);
   }
 }
 
