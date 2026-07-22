@@ -78,7 +78,7 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 // price check, and a funding-short replenish overrides everything.
 const REBALANCE_MIN_BUYS = 3; // rebalance: accumulate at least this many buys before considering an exit
 const DCA_MIN_BUYS = 10; // dca: accumulate at least this many buys before considering an exit
-const PROFIT_TARGET_BPS = 10; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
+const PROFIT_TARGET_BPS = 5; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
 const REFILL_TRADES = 5; // funding-short exits sell only enough inventory to fund about this many forward trades
 const MAX_HOLD_MS = 20 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
 const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
