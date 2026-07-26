@@ -485,7 +485,7 @@ async function runDirectTrading() {
 
   const [usdm, celoBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance("CELO")]);
 
-  // ---- EXIT: sell CELO inventory for cost basis + PROFIT_TARGET_BPS (10),
+  // ---- EXIT: sell CELO inventory for cost basis + PROFIT_TARGET_BPS (5),
   // reserving 1 CELO for gas. Considered after even a single buy
   // (DIRECT_MIN_BUYS = 1) so a position that pops +10bps sells immediately;
   // otherwise force-recycled at MAX_HOLD_MS (20 min). ----
@@ -505,7 +505,7 @@ async function runDirectTrading() {
     const takeProfit = bestQuote !== null && bestQuote >= target;
     if (takeProfit || heldMs >= MAX_HOLD_MS) {
       const res = await executeDirectSwap(uid, "CELO", "USDm", sellable, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-      console.log(`${tag} exit CELO->USDm (${takeProfit ? "take-profit +10bps" : "20min recycle"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+      console.log(`${tag} exit CELO->USDm (${takeProfit ? `take-profit +${PROFIT_TARGET_BPS}bps` : "20min recycle"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
       return;
     }
   }
@@ -513,7 +513,7 @@ async function runDirectTrading() {
   // ---- ENTRY: buy 50 USDm of CELO every tick, UNGATED (owner-set, volume
   // mode). The oracle edge is still computed and shown for visibility but
   // no longer blocks the buy — profit protection is entirely the cost-basis
-  // take-profit above (voluntary exits are always +10bps green). The
+  // take-profit above (voluntary exits are always +5bps green). The
   // trade-off, accepted: in a flat/falling market the 20-min recycle books
   // small losses. That is the price of continuous volume.
   if (usdm >= tradeIn) {
