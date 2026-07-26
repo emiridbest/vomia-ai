@@ -1,6 +1,13 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import AppProviders from "./providers/AppProviders";
+
+// MiniPay runs the mini app in a mobile webview — a device-width viewport is
+// required for it to render at phone scale rather than zoomed-out desktop.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+};
 
 export const metadata: Metadata = {
   title: "Vomia — your money runs itself, and stays yours",
