@@ -510,20 +510,21 @@ async function runDirectTrading() {
     }
   }
 
-  // ---- ENTRY: rebalance, 50 USDm, edge-gated ----
+  // ---- ENTRY: buy 50 USDm of CELO every tick, UNGATED (owner-set, volume
+  // mode). The oracle edge is still computed and shown for visibility but
+  // no longer blocks the buy — profit protection is entirely the cost-basis
+  // take-profit above (voluntary exits are always +10bps green). The
+  // trade-off, accepted: in a flat/falling market the 20-min recycle books
+  // small losses. That is the price of continuous volume.
   if (usdm >= tradeIn) {
     const scan = await scanPair("USDm", "CELO", tradeIn, DIRECT_TRADE_USDM, DIRECT_PROFILE);
     await accrueFee(uid, "check");
     pingX402Check("USDm", "CELO", DIRECT_TRADE_USDM);
-    if (scan.decision === "execute") {
-      const res = await executeDirectSwap(uid, "USDm", "CELO", tradeIn, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-      console.log(`${tag} rebalance USDm->CELO 50 (edge ${scan.netEdgeBps}bps): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
-      return;
-    }
-    console.log(`${tag} rebalance USDm->CELO: ${scan.decision} (${scan.reason})`);
-  } else {
-    console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${DIRECT_TRADE_USDM} — awaiting an exit to replenish.`);
+    const res = await executeDirectSwap(uid, "USDm", "CELO", tradeIn, DIRECT_PROFILE.maxSlippageBps, "rebalance");
+    console.log(`${tag} buy USDm->CELO 50 (edge ${scan.netEdgeBps}bps, ungated): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+    return;
   }
+  console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${DIRECT_TRADE_USDM} — awaiting an exit to replenish.`);
 }
 
 async function tick() {
