@@ -54,7 +54,7 @@ import { rpcUrl } from "../lib/chains";
 // gas. Fund the operator wallet with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-const DIRECT_TRADE_USDM = 20; // owner-set: operator rebalance buy size, in USDm
+const DIRECT_TRADE_USDM = 10; // owner-set: operator rebalance buy size, in USDm
 const DIRECT_MIN_BUYS = 1; // consider an exit after even one buy so a +10bps pop sells immediately
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
