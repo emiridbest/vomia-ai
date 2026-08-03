@@ -59,7 +59,7 @@ import { rpcUrl } from "../lib/chains";
 // gas. Fund the operator wallet with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-const DIRECT_DCA_USDM = 10; // owner-set: operator DCA buy size, in USDm
+const DIRECT_DCA_USDM = 25; // owner-set: operator DCA buy size, in USDm
 const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
 const DIRECT_DCA_MIN_BUYS = 3; // sell from the 4th buy on, but only if the quote is green
 const DIRECT_DCA_MAX_BUYS = 3; // ...and unconditionally by the 5th
