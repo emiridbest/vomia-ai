@@ -27,6 +27,11 @@
  * Either way, the vault contract re-enforces every cap on-chain regardless
  * of what this code sends.
  *
+ * All of the above is the vault product. When OPERATOR_DIRECT_TRADING is set
+ * the worker does none of it, and instead DCAs the operator EOA's own balance
+ * (runDirectDca) — the operator's funds, not any user's vault, and the only
+ * trades that score Track 1 tagged volume. See that function for why.
+ *
  * Run this as a single separate process (Railway/Fly/a VPS), NOT inside
  * the Next.js serverless app — serverless instances can overlap, and two
  * workers double-submitting is exactly what the vault's actionId
@@ -49,13 +54,18 @@ import { rpcUrl } from "../lib/chains";
 
 // Operator-wallet DIRECT trading. Vault-mediated trades score ZERO Track 1
 // tagged volume (a contract is never tx_from), so when this is on the worker
-// trades the operator EOA's own USDm/CELO directly (tag on the tx tail,
+// DCAs the operator EOA's own USDm/CELO directly (tag on the tx tail,
 // tx_from == token sender) and skips the per-vault loops entirely to conserve
 // gas. Fund the operator wallet with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-const DIRECT_TRADE_USDM = 35; // owner-set: operator rebalance buy size, in USDm
-const DIRECT_MIN_BUYS = 1; // consider an exit after even one buy so a +10bps pop sells immediately
+const DIRECT_DCA_USDM = 10; // owner-set: operator DCA buy size, in USDm
+const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
+const DIRECT_DCA_MIN_BUYS = 3; // sell from the 4th buy on, but only if the quote is green
+const DIRECT_DCA_MAX_BUYS = 3; // ...and unconditionally by the 5th
+const DIRECT_DCA_MAX_HOLD_MS = 5 * 60 * 1000; // wall-clock backstop for that same "by the 5th minute" rule
+const DIRECT_DCA_PROFIT_BPS = 5; // a voluntary (4th-buy) exit must beat the cycle's cost basis by this
+const DIRECT_MAX_SLIPPAGE_BPS = 100;
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
@@ -78,9 +88,9 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 // price check, and a funding-short replenish overrides everything.
 const REBALANCE_MIN_BUYS = 3; // rebalance: accumulate at least this many buys before considering an exit
 const DCA_MIN_BUYS = 10; // dca: accumulate at least this many buys before considering an exit
-const PROFIT_TARGET_BPS = 5; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
+const PROFIT_TARGET_BPS = 10; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
 const REFILL_TRADES = 5; // funding-short exits sell only enough inventory to fund about this many forward trades
-const MAX_HOLD_MS = 10 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
+const MAX_HOLD_MS = 20 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
 const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
 
 // The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
@@ -163,12 +173,14 @@ let ticking = false;
 
 
 /** Buys since the most recent reverse trade: how many, their total tokenIn
- * spend (the inventory's cost basis, raw units), and the oldest buy's age. */
+ * spend (the inventory's cost basis, raw units), the total tokenOut they
+ * bought (quoted, so within slippage of what actually landed), and the oldest
+ * buy's age. */
 async function forwardsSinceLastReverse(
   userId: string,
   tokenIn: TokenSymbol,
   tokenOut: TokenSymbol
-): Promise<{ count: number; totalIn: bigint; oldestAt: Date | null }> {
+): Promise<{ count: number; totalIn: bigint; totalOut: bigint; oldestAt: Date | null }> {
   const lastReverse = await TradeLog.findOne({
     userId,
     tokenIn: tokenOut,
@@ -184,8 +196,12 @@ async function forwardsSinceLastReverse(
     createdAt: { $gt: since },
   }).sort({ createdAt: 1 }).lean();
   let totalIn = 0n;
-  for (const f of forwards) totalIn += BigInt(f.amountIn);
-  return { count: forwards.length, totalIn, oldestAt: forwards.length ? forwards[0].createdAt : null };
+  let totalOut = 0n;
+  for (const f of forwards) {
+    totalIn += BigInt(f.amountIn);
+    if (f.amountOut) totalOut += BigInt(f.amountOut);
+  }
+  return { count: forwards.length, totalIn, totalOut, oldestAt: forwards.length ? forwards[0].createdAt : null };
 }
 
 /**
@@ -470,61 +486,101 @@ async function runArbitrage(user: any, profile: any) {
   }
 }
 
-const DIRECT_PROFILE = { minProfitBps: 5, maxSlippageBps: 100, maxTradesPerDay: 1_000_000, enabledStrategies: ["rebalance"] as ("rebalance" | "arbitrage" | "remittance" | "dca")[] };
-
 /**
- * Trade the operator EOA's own balance directly (USDm<->CELO), so the tx
- * scores Track 1 tagged volume. One action per tick (exit > rebalance entry >
- * DCA), each awaiting its receipt, to keep nonces serial. Always leaves
- * GAS_RESERVE_CELO untouched for gas.
+ * DCA on the operator EOA's OWN balance (USDm -> CELO). This is the only
+ * shape of trade that scores Track 1 tagged volume: tx_from == the token
+ * sender, so the input leg is credited at full USD value. A vault trade never
+ * can be — a contract is never tx_from.
+ *
+ * The schedule, owner-set: buy DIRECT_DCA_USDM (10) of CELO once a minute,
+ * price-independent (that is what makes it DCA rather than the rebalance
+ * strategy), then close the cycle back to USDm from the 4th buy on if the
+ * quote beats the cycle's cost basis, and unconditionally by the 5th.
+ *
+ * The working balance sets the real cycle length, because the wallet spends
+ * its whole float before the exit returns it: a 30 USDm float buys 3 times
+ * and then exits on the funding-short trigger below, so cycles run ~3-5
+ * minutes and turn over ~30 USDm. Fund it with 50+ USDm to actually reach
+ * the 4th and 5th buys.
+ *
+ * The sell is capped at what the logged buys since the last exit actually
+ * accumulated, rather than being the whole balance less a gas reserve: any
+ * pre-existing CELO was never bought at one of this cycle's prices, so
+ * including it both skews the cost-basis check and spends the gas float.
+ *
+ * One action per tick, each awaiting its receipt, to keep nonces serial.
  */
-async function runDirectTrading() {
+async function runDirectDca() {
   const { id: uid, address } = await ensureOperatorUser();
   const tag = `[direct ${address.slice(0, 8)}]`;
-  const tradeIn = BigInt(Math.floor(DIRECT_TRADE_USDM * 1e18)); // owner-set: 50 USDm rebalance buys
-
+  const amountIn = BigInt(DIRECT_DCA_USDM) * 10n ** BigInt(TOKENS.USDm.decimals);
   const [usdm, celoBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance("CELO")]);
+  const { count, totalIn: costBasis, totalOut: inventory, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", "CELO");
 
-  // ---- EXIT: sell CELO inventory for cost basis + PROFIT_TARGET_BPS (5),
-  // reserving 1 CELO for gas. Considered after even a single buy
-  // (DIRECT_MIN_BUYS = 1) so a position that pops +10bps sells immediately;
-  // otherwise force-recycled at MAX_HOLD_MS (20 min). ----
-  const sellable = celoBal > GAS_RESERVE_CELO ? celoBal - GAS_RESERVE_CELO : 0n;
-  const { count, totalIn: costBasis, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", "CELO");
-  if (sellable > 0n && count >= DIRECT_MIN_BUYS) {
-    const [m, u] = await Promise.all([
-      getMentoQuote("CELO", "USDm", sellable).then((q) => q?.amountOut ?? null).catch(() => null),
-      getUniswapQuote("CELO", "USDm", sellable).catch(() => null),
-    ]);
-    const bestQuote = m !== null && u !== null ? (m > u ? m : u) : (m ?? u);
-    await accrueFee(uid, "check");
-    pingX402Check("CELO", "USDm", Number(sellable / 10n ** 18n));
-    const basisPortion = celoBal > 0n ? (costBasis * sellable) / celoBal : costBasis;
-    const target = basisPortion + (basisPortion * BigInt(PROFIT_TARGET_BPS)) / 10000n;
-    const heldMs = oldestAt ? Date.now() - oldestAt.getTime() : 0;
-    const takeProfit = bestQuote !== null && bestQuote >= target;
-    if (takeProfit || heldMs >= MAX_HOLD_MS) {
-      const res = await executeDirectSwap(uid, "CELO", "USDm", sellable, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-      console.log(`${tag} exit CELO->USDm (${takeProfit ? `take-profit +${PROFIT_TARGET_BPS}bps` : "20min recycle"}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
-      return;
+  // ---- EXIT: sell the cycle's CELO back to USDm. Eligible from the 4th buy,
+  // OR as soon as the wallet can't fund the next buy — on a working balance
+  // under DIRECT_DCA_USDM * DIRECT_DCA_MIN_BUYS the cycle just ends short (a
+  // 30 USDm float buys 3 times, not 4). Without that second trigger the loop
+  // deadlocks: no USDm left to buy with, and a buy count permanently below
+  // the exit gate, so it would sit there logging skips forever.
+  //
+  // Either way the exit is taken only if it beats cost basis +
+  // DIRECT_DCA_PROFIT_BPS; the 5th buy or a 5-minute hold forces it
+  // regardless of price, which is what bounds the cycle. ----
+  const outOfFunds = usdm < amountIn;
+  if ((count >= DIRECT_DCA_MIN_BUYS || outOfFunds) && inventory > 0n) {
+    const headroom = celoBal > GAS_RESERVE_CELO ? celoBal - GAS_RESERVE_CELO : 0n;
+    const sellable = inventory < headroom ? inventory : headroom;
+    if (sellable > 0n) {
+      const [m, u] = await Promise.all([
+        getMentoQuote("CELO", "USDm", sellable).then((q) => q?.amountOut ?? null).catch(() => null),
+        getUniswapQuote("CELO", "USDm", sellable).catch(() => null),
+      ]);
+      const bestQuote = m !== null && u !== null ? (m > u ? m : u) : (m ?? u);
+      await accrueFee(uid, "check");
+      pingX402Check("CELO", "USDm", Number(sellable / 10n ** 18n));
+      const basisPortion = (costBasis * sellable) / inventory;
+      const target = basisPortion + (basisPortion * BigInt(DIRECT_DCA_PROFIT_BPS)) / 10000n;
+      const heldMs = oldestAt ? Date.now() - oldestAt.getTime() : 0;
+      const takeProfit = bestQuote !== null && bestQuote >= target;
+      const forced = count >= DIRECT_DCA_MAX_BUYS || heldMs >= DIRECT_DCA_MAX_HOLD_MS;
+      if (takeProfit || forced) {
+        const why = takeProfit
+          ? `take-profit +${DIRECT_DCA_PROFIT_BPS}bps`
+          : count >= DIRECT_DCA_MAX_BUYS
+            ? `forced at ${count} buys`
+            : `forced at ${Math.round(heldMs / 60000)}min hold`;
+        const res = await executeDirectSwap(uid, "CELO", "USDm", sellable, DIRECT_MAX_SLIPPAGE_BPS, "dca");
+        console.log(`${tag} dca sell CELO->USDm, closing a ${count}-buy cycle (${why}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+        return;
+      }
+      const held = `${Math.round(heldMs / 60000)}min`;
+      console.log(
+        `${tag} dca holding ${count} buys${outOfFunds ? " (out of USDm — this cycle is done buying)" : ""} at ${held} — quote under cost basis +${DIRECT_DCA_PROFIT_BPS}bps; sells anyway by ${DIRECT_DCA_MAX_HOLD_MS / 60000}min.`
+      );
+      // Out of USDm means there is no buy to fall through to.
+      if (outOfFunds) return;
     }
   }
 
-  // ---- ENTRY: buy 50 USDm of CELO every tick, UNGATED (owner-set, volume
-  // mode). The oracle edge is still computed and shown for visibility but
-  // no longer blocks the buy — profit protection is entirely the cost-basis
-  // take-profit above (voluntary exits are always +5bps green). The
-  // trade-off, accepted: in a flat/falling market the 20-min recycle books
-  // small losses. That is the price of continuous volume.
-  if (usdm >= tradeIn) {
-    const scan = await scanPair("USDm", "CELO", tradeIn, DIRECT_TRADE_USDM, DIRECT_PROFILE);
-    await accrueFee(uid, "check");
-    pingX402Check("USDm", "CELO", DIRECT_TRADE_USDM);
-    const res = await executeDirectSwap(uid, "USDm", "CELO", tradeIn, DIRECT_PROFILE.maxSlippageBps, "rebalance");
-    console.log(`${tag} buy USDm->CELO 50 (edge ${scan.netEdgeBps}bps, ungated): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
+  // ---- BUY: 10 USDm of CELO, once a minute, price-independent. Gated on the
+  // last buy's timestamp rather than on the tick, so the cadence stays a real
+  // minute whatever HEARTBEAT_SECONDS is set to. ----
+  if (outOfFunds) {
+    console.log(`${tag} dca skipped — operator USDm ${(Number(usdm) / 1e18).toFixed(2)} is below the ${DIRECT_DCA_USDM} buy size and there is no inventory to sell. Top the wallet up.`);
     return;
   }
-  console.log(`${tag} USDm ${(Number(usdm) / 1e18).toFixed(2)} below trade size ${DIRECT_TRADE_USDM} — awaiting an exit to replenish.`);
+  const lastBuy = await TradeLog.findOne({
+    userId: uid,
+    tokenIn: "USDm",
+    tokenOut: "CELO",
+    status: { $in: ["submitted", "settled"] },
+  }).sort({ createdAt: -1 });
+  if (lastBuy && Date.now() - lastBuy.createdAt.getTime() < DIRECT_DCA_INTERVAL_MS) return;
+  await accrueFee(uid, "check");
+  pingX402Check("USDm", "CELO", DIRECT_DCA_USDM);
+  const res = await executeDirectSwap(uid, "USDm", "CELO", amountIn, DIRECT_MAX_SLIPPAGE_BPS, "dca");
+  console.log(`${tag} dca buy ${DIRECT_DCA_USDM} USDm->CELO (buy ${count + 1} of this cycle): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
 }
 
 async function tick() {
@@ -535,7 +591,7 @@ async function tick() {
   try {
     await connectDB();
     if (OPERATOR_DIRECT_TRADING) {
-      await runDirectTrading();
+      await runDirectDca();
       return;
     }
     await reconcileVaultsFromChain();
