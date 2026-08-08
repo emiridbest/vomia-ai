@@ -68,7 +68,7 @@ const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operat
 // float drops under 300 within hours, the third buy stops being fundable,
 // and cycles silently degrade from three buys to two — a third of the
 // throughput lost to save nothing.
-const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 90);
+const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 140);
 // The asset bought and sold back. Tagged volume is credited in USD on the
 // input leg and does not care which asset moved, so the pair is a pure cost
 // choice — and a stable leg is drastically cheaper than a volatile one.
