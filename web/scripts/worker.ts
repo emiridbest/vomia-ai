@@ -80,19 +80,19 @@ const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 300);
 // that drift being the real source of the -0.79%/turnover the rebalance
 // strategy saw. A stable leg has no drift to lose to: both sides are ~$1.
 //
-// USDT also splits across venues: Uniswap's 0.01% pool generally quotes the
-// better USDm->USDT, Mento the better USDT->USDm.
 const DIRECT_DCA_TOKEN = (process.env.DIRECT_DCA_TOKEN as TokenSymbol) || "USDT";
 // Owner-set: each leg is PINNED to one venue rather than taking whichever
-// quotes higher at the time. The two do flip on this pair — measured minutes
-// apart, Mento won USDT->USDm on one sample and Uniswap on the next, about a
-// basis point either way — so pinning knowingly gives up that basis point in
-// exchange for a deterministic route. Both venues score tagged volume
-// identically (the operator EOA is tx_from either way), so this is purely a
-// routing choice, not a scoring one. A pin is ignored only if that venue has
-// no route at all, which is logged rather than silently swallowed.
+// quotes higher at the time. Both are Uniswap's 0.01% pool, which measured
+// better on BOTH directions across every size from $10 to $330 (-5.93bps
+// going in, 7.93bps coming back, flat with size — the cost is a fixed peg
+// offset, not slippage). Mento does win USDT->USDm sometimes; the two flip
+// by around a basis point, and pinning knowingly gives that up in exchange
+// for a deterministic route. Both venues score tagged volume identically
+// (the operator EOA is tx_from either way), so this is a routing choice
+// only. A pin is ignored just when that venue has no route at all, which is
+// logged rather than silently swallowed.
 const DIRECT_DCA_BUY_VENUE = "uniswap" as const; // USDm -> DIRECT_DCA_TOKEN
-const DIRECT_DCA_SELL_VENUE = "mento" as const; // DIRECT_DCA_TOKEN -> USDm
+const DIRECT_DCA_SELL_VENUE = "uniswap" as const; // DIRECT_DCA_TOKEN -> USDm
 const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
 // MIN == MAX makes every cycle a fixed round trip: the exit becomes eligible
 // and forced on the same tick, so the take-profit test below never gates
