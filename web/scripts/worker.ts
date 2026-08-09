@@ -59,16 +59,19 @@ import { rpcUrl } from "../lib/chains";
 // gas. Fund the operator wallet with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-// Owner-set buy size, in USDm. The only real throughput lever: daily volume
-// is ~2,880 * this (480 three-minute cycles a day, three buys and one sell
-// each). Env-tunable so it can be retuned without a redeploy. The wallet
-// needs DIRECT_DCA_MAX_BUYS * this in USDm; any float above that sits idle.
-// 90, not 100, against the funded 300 USDm float: three buys is 270 and the
-// spare 30 absorbs the ~1bp bled per round trip. Sized at exactly 100 the
-// float drops under 300 within hours, the third buy stops being fundable,
-// and cycles silently degrade from three buys to two — a third of the
-// throughput lost to save nothing.
-const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 90);
+// Owner-set buy size, in USDm, and the only real throughput lever: daily
+// volume is ~2,880 * this. Env-tunable, so it can be retuned without a
+// redeploy. The wallet must hold DIRECT_DCA_MAX_BUYS * this; anything above
+// that sits idle.
+//
+// That 2,880 holds for ANY buys-per-cycle, because a cycle's length is set by
+// the one-buy-per-minute cadence: N buys means an N-minute cycle carrying N
+// times the notional. What does change is the float needed to sustain it —
+// N * this — so the fewer buys per cycle, the more volume the same float
+// produces. At one buy the whole float turns over every minute instead of
+// every third minute, which is why 300x1 does ~864k/day where 90x3 did ~259k
+// off the same money.
+const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 300);
 // The asset bought and sold back. Tagged volume is credited in USD on the
 // input leg and does not care which asset moved, so the pair is a pure cost
 // choice — and a stable leg is drastically cheaper than a volatile one.
@@ -91,14 +94,20 @@ const DIRECT_DCA_TOKEN = (process.env.DIRECT_DCA_TOKEN as TokenSymbol) || "USDT"
 const DIRECT_DCA_BUY_VENUE = "uniswap" as const; // USDm -> DIRECT_DCA_TOKEN
 const DIRECT_DCA_SELL_VENUE = "mento" as const; // DIRECT_DCA_TOKEN -> USDm
 const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
-// MIN == MAX (both 3) makes every cycle a fixed three-buy round trip: the
-// exit becomes eligible and forced on the same tick, so the take-profit test
-// below never gates anything and DIRECT_DCA_PROFIT_BPS only labels the log
-// line. Deliberate — it maximizes turnover, at the cost of paying the spread
-// on every cycle instead of waiting for green quotes. Set MAX above MIN to
-// get the price selectivity back.
-const DIRECT_DCA_MIN_BUYS = 3; // exit becomes eligible at this many buys
-const DIRECT_DCA_MAX_BUYS = 3; // ...and is forced regardless of price at this many
+// MIN == MAX makes every cycle a fixed round trip: the exit becomes eligible
+// and forced on the same tick, so the take-profit test below never gates
+// anything and DIRECT_DCA_PROFIT_BPS only labels the log line. Deliberate —
+// it maximizes turnover, at the cost of paying the ~2bp round trip every
+// cycle instead of waiting for green quotes. Set MAX above MIN to get the
+// price selectivity back.
+//
+// At 1, a cycle is buy-then-sell-then-wait-for-the-minute: the sell lands on
+// the tick after the buy and the next buy is gated by DIRECT_DCA_INTERVAL_MS,
+// so the whole float round-trips once a minute. That is the throughput
+// ceiling for a given float, and it makes the hold backstop irrelevant in
+// normal operation — it only matters if a buy fails and the count lags.
+const DIRECT_DCA_MIN_BUYS = 1; // exit becomes eligible at this many buys
+const DIRECT_DCA_MAX_BUYS = 1; // ...and is forced regardless of price at this many
 const DIRECT_DCA_MAX_HOLD_MS = 5 * 60 * 1000; // wall-clock backstop, if a buy fails and the count lags
 const DIRECT_DCA_PROFIT_BPS = 5; // margin over cost basis a voluntary exit must clear (see MIN/MAX note)
 const DIRECT_MAX_SLIPPAGE_BPS = 100;
