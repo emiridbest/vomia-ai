@@ -68,7 +68,7 @@ const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operat
 // float drops under 300 within hours, the third buy stops being fundable,
 // and cycles silently degrade from three buys to two — a third of the
 // throughput lost to save nothing.
-const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 140);
+const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 90);
 // The asset bought and sold back. Tagged volume is credited in USD on the
 // input leg and does not care which asset moved, so the pair is a pure cost
 // choice — and a stable leg is drastically cheaper than a volatile one.
@@ -77,11 +77,19 @@ const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 140);
 // that drift being the real source of the -0.79%/turnover the rebalance
 // strategy saw. A stable leg has no drift to lose to: both sides are ~$1.
 //
-// USDT also splits cleanly across venues: Uniswap's 0.01% pool quotes the
-// better USDm->USDT, Mento the better USDT->USDm. executeDirectSwap already
-// takes the higher quote per leg independently, so that routing falls out on
-// its own and re-checks every trade rather than being pinned to a snapshot.
+// USDT also splits across venues: Uniswap's 0.01% pool generally quotes the
+// better USDm->USDT, Mento the better USDT->USDm.
 const DIRECT_DCA_TOKEN = (process.env.DIRECT_DCA_TOKEN as TokenSymbol) || "USDT";
+// Owner-set: each leg is PINNED to one venue rather than taking whichever
+// quotes higher at the time. The two do flip on this pair — measured minutes
+// apart, Mento won USDT->USDm on one sample and Uniswap on the next, about a
+// basis point either way — so pinning knowingly gives up that basis point in
+// exchange for a deterministic route. Both venues score tagged volume
+// identically (the operator EOA is tx_from either way), so this is purely a
+// routing choice, not a scoring one. A pin is ignored only if that venue has
+// no route at all, which is logged rather than silently swallowed.
+const DIRECT_DCA_BUY_VENUE = "uniswap" as const; // USDm -> DIRECT_DCA_TOKEN
+const DIRECT_DCA_SELL_VENUE = "mento" as const; // DIRECT_DCA_TOKEN -> USDm
 const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
 // MIN == MAX (both 3) makes every cycle a fixed three-buy round trip: the
 // exit becomes eligible and forced on the same tick, so the take-profit test
@@ -581,7 +589,7 @@ async function runDirectDca() {
           : count >= DIRECT_DCA_MAX_BUYS
             ? `forced at ${count} buys`
             : `forced at ${Math.round(heldMs / 60000)}min hold`;
-        const res = await executeDirectSwap(uid, mid, "USDm", sellable, DIRECT_MAX_SLIPPAGE_BPS, "dca");
+        const res = await executeDirectSwap(uid, mid, "USDm", sellable, DIRECT_MAX_SLIPPAGE_BPS, "dca", DIRECT_DCA_SELL_VENUE);
         console.log(`${tag} dca sell ${mid}->USDm, closing a ${count}-buy cycle (${why}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
         return;
       }
@@ -610,7 +618,7 @@ async function runDirectDca() {
   if (lastBuy && Date.now() - lastBuy.createdAt.getTime() < DIRECT_DCA_INTERVAL_MS) return;
   await accrueFee(uid, "check");
   pingX402Check("USDm", mid, DIRECT_DCA_USDM);
-  const res = await executeDirectSwap(uid, "USDm", mid, amountIn, DIRECT_MAX_SLIPPAGE_BPS, "dca");
+  const res = await executeDirectSwap(uid, "USDm", mid, amountIn, DIRECT_MAX_SLIPPAGE_BPS, "dca", DIRECT_DCA_BUY_VENUE);
   console.log(`${tag} dca buy ${DIRECT_DCA_USDM} USDm->${mid} (buy ${count + 1} of this cycle): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
 }
 
