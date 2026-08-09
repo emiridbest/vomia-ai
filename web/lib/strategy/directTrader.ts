@@ -113,7 +113,16 @@ export async function executeDirectSwap(
   tokenOut: TokenSymbol,
   amountIn: bigint,
   maxSlippageBps: number,
-  strategy: "rebalance" | "dca"
+  strategy: "rebalance" | "dca",
+  /**
+   * Pin this leg to one venue instead of taking whichever quotes higher.
+   * The pin is honoured even when the other venue is quoting better — that
+   * is the point of pinning, and the cost is real (the two flip on this pair
+   * by around a basis point). It is NOT honoured when the pinned venue has
+   * no route at all: falling back beats stalling the loop, and the fallback
+   * is logged loudly rather than silently.
+   */
+  preferVenue?: "mento" | "uniswap"
 ): Promise<DirectResult> {
   const [mento, uni] = await Promise.all([
     getMentoQuote(tokenIn, tokenOut, amountIn).catch(() => null),
@@ -124,7 +133,14 @@ export async function executeDirectSwap(
   if (mentoOut === null && uniOut === null) {
     return { status: "skipped-no-route", reason: `No venue routes ${tokenIn}->${tokenOut}.` };
   }
-  const useMento = mentoOut !== null && (uniOut === null || mentoOut >= uniOut);
+  let useMento: boolean;
+  if (preferVenue === "mento") useMento = mentoOut !== null;
+  else if (preferVenue === "uniswap") useMento = uniOut === null;
+  else useMento = mentoOut !== null && (uniOut === null || mentoOut >= uniOut);
+  const pinMissed = preferVenue !== undefined && useMento !== (preferVenue === "mento");
+  if (pinMissed) {
+    console.warn(`[direct] ${tokenIn}->${tokenOut}: pinned to ${preferVenue} but it has no route; falling back to ${useMento ? "mento" : "uniswap"}.`);
+  }
   const quotedOut = (useMento ? mentoOut : uniOut) as bigint;
   const minAmountOut = (quotedOut * BigInt(10000 - maxSlippageBps)) / 10000n;
 
