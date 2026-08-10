@@ -1,10 +1,7 @@
 /**
- * The risk profile is the knob the user turns; the scanner and executor
- * both read it before doing anything. This is also where the agent "asks
- * and demands" on risk/profit margins, as requested — see
- * `reviewProposedProfile` below. The agent can refuse to run with a
- * self-destructive setting, the same way a competent human operator would
- * push back rather than silently comply.
+ * The risk profile is the knob the user turns; the scanner and executor read
+ * it before acting. reviewProposedProfile below is where the agent pushes
+ * back on self-destructive settings rather than silently complying.
  */
 
 export type Strategy = "rebalance" | "arbitrage" | "remittance" | "dca";
@@ -17,10 +14,10 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: 5, // 0.05% net edge floor. A -40bps experiment proved the theory wrong at 1-minute holds: entries at -4..-11bps followed by quick exits were pure spread bleed with no time for drift to help — reverted at the owner's request after live losses
+  minProfitBps: 5, // 0.05% net edge floor (below-gas floors were pure spread bleed at 1-minute holds)
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
-  enabledStrategies: ["rebalance"],
+  enabledStrategies: ["arbitrage"],
 };
 
 export interface ProfileReview {
@@ -30,25 +27,19 @@ export interface ProfileReview {
 }
 
 /**
- * The agent's "push back" step. Called whenever a user proposes a new risk
- * profile (from the dashboard or from a plain-language chat instruction).
- * This does not silently accept numbers that would make the bot lose money
- * or trade recklessly — it explains what's wrong and offers a safer
- * alternative, mirroring how the vault contract itself hard-caps
- * maxSlippageBps at 20%.
+ * The agent's push-back step, called whenever a user proposes a new risk
+ * profile. Rather than silently accepting numbers that lose money or trade
+ * recklessly, it warns and offers a safer alternative (and hard-caps
+ * maxSlippageBps at the vault's own 20% ceiling).
  */
 export function reviewProposedProfile(proposed: Partial<RiskProfile>, estimatedGasBps: number): ProfileReview {
   const warnings: string[] = [];
   const adjusted: Partial<RiskProfile> = { ...proposed };
 
   if (proposed.minProfitBps !== undefined && proposed.minProfitBps < estimatedGasBps) {
-    // Warn but do NOT override: a below-gas (even negative) floor is a
-    // deliberate, supported configuration — measured cycle data showed
-    // entry edge barely predicts realized P&L on volatile pairs (drift
-    // during the hold dominates), so an owner may intentionally trade
-    // through negative measured edges for volume/drift exposure. The
-    // agent's job here is informed consent, not a veto: the warning is
-    // shown, and the value only saves after the owner acknowledges it.
+    // Warn but don't override: a below-gas floor is a supported, deliberate
+    // choice (trading through negative measured edge for volume/drift
+    // exposure). Informed consent, not a veto — it saves after acknowledgement.
     warnings.push(
       `A minimum profit of ${proposed.minProfitBps}bps is below the estimated gas+fee cost of ` +
         `${estimatedGasBps}bps per trade — entries will knowingly execute at negative measured edge, relying on ` +

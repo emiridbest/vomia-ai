@@ -2,41 +2,17 @@
  * The Vomia worker — the always-on heartbeat (run with `npm run worker`).
  *
  * Every HEARTBEAT_SECONDS it loads all users with an unpaused risk profile
- * and runs whichever strategies they've enabled:
+ * and runs their enabled strategies: arbitrage (buy CELO on Squid, sell on
+ * Uniswap), rebalance (profit-gated cross-venue swaps), and dca (fixed
+ * price-independent buys). Forward strategies are one-directional and
+ * cycleBackIfDue() swaps accumulated balances back to USDm to avoid
+ * exhaustion. When OPERATOR_DIRECT_TRADING is set the worker instead trades
+ * the operator EOA's own balance (runDirectDca) — the only path that scores
+ * Track 1 tagged volume, since a vault contract is never tx_from.
  *
- *   - rebalance: scans each allowed token pair across venues, and for any
- *     scan that clears the user's own profit margin (against Mento's own
- *     oracle reference rate — see lib/dex/oracle.ts), executes through
- *     their vault. Never manufactures a trade to hit a volume number —
- *     every skipped tick is logged with its reason.
- *   - dca: buys a fixed amount into CELO and G$ from USDm on a fixed
- *     schedule (DCA_INTERVAL_MS), independent of price — that's the
- *     definition of dollar-cost-averaging. It rides this same heartbeat
- *     rather than running its own timer: each tick just checks, per user
- *     and per DCA pair, whether enough time has passed since the last DCA
- *     trade (via TradeLog), and only then executes.
- *
- * Both strategies are one-directional by default (USDm spent, never
- * replenished), which would eventually exhaust the vault's USDm balance.
- * cycleBackIfDue() catches this: after REBALANCE_CYCLE_LIMIT forward trades
- * into a currency (rebalance) or DCA_CYCLE_LIMIT forward buys (dca), it
- * swaps the entire accumulated balance of that token back to USDm instead
- * of doing another forward trade. This also gives a natural checkpoint to
- * see whether a cycle actually netted more or less USDm than was spent.
- *
- * Either way, the vault contract re-enforces every cap on-chain regardless
- * of what this code sends.
- *
- * All of the above is the vault product. When OPERATOR_DIRECT_TRADING is set
- * the worker does none of it, and instead DCAs the operator EOA's own balance
- * (runDirectDca) — the operator's funds, not any user's vault, and the only
- * trades that score Track 1 tagged volume. See that function for why.
- *
- * Run this as a single separate process (Railway/Fly/a VPS), NOT inside
- * the Next.js serverless app — serverless instances can overlap, and two
- * workers double-submitting is exactly what the vault's actionId
- * idempotency exists to catch, but there's no reason to lean on the last
- * line of defense by design.
+ * The vault contract re-enforces every cap on-chain regardless of what this
+ * code sends. Run as a single separate process (not the serverless app) so
+ * overlapping workers can't double-submit.
  */
 import { createPublicClient, http, type Address } from "viem";
 import { celo } from "viem/chains";
@@ -52,99 +28,56 @@ import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
 import { rpcUrl } from "../lib/chains";
 
-// Operator-wallet DIRECT trading. Vault-mediated trades score ZERO Track 1
-// tagged volume (a contract is never tx_from), so when this is on the worker
-// DCAs the operator EOA's own USDm/CELO directly (tag on the tx tail,
-// tx_from == token sender) and skips the per-vault loops entirely to conserve
-// gas. Fund the operator wallet with USDm to trade + CELO for gas.
+// Operator-wallet DIRECT trading. Vault trades score zero tagged volume (a
+// contract is never tx_from), so when this is on the worker trades the
+// operator EOA's own balance directly. Fund it with USDm to trade + CELO for gas.
 const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-// Owner-set buy size, in USDm, and the only real throughput lever: daily
-// volume is ~2,880 * this. Env-tunable, so it can be retuned without a
-// redeploy. The wallet must hold DIRECT_DCA_MAX_BUYS * this; anything above
-// that sits idle.
-//
-// That 2,880 holds for ANY buys-per-cycle, because a cycle's length is set by
-// the one-buy-per-minute cadence: N buys means an N-minute cycle carrying N
-// times the notional. What does change is the float needed to sustain it —
-// N * this — so the fewer buys per cycle, the more volume the same float
-// produces. At one buy the whole float turns over every minute instead of
-// every third minute, which is why 300x1 does ~864k/day where 90x3 did ~259k
-// off the same money.
+// Buy size in USDm — the throughput lever (daily volume ~= 2,880 * this).
+// The wallet must hold DIRECT_DCA_MAX_BUYS * this; anything above sits idle.
 const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 300);
-// The asset bought and sold back. Tagged volume is credited in USD on the
-// input leg and does not care which asset moved, so the pair is a pure cost
-// choice — and a stable leg is drastically cheaper than a volatile one.
-// Measured live at 25 USDm: USDT round-trips at 1bp ($0.0030), USDC at 1bp
-// ($0.0042), CELO at 22bps ($0.056) plus drift over the 2-3 minute hold —
-// that drift being the real source of the -0.79%/turnover the rebalance
-// strategy saw. A stable leg has no drift to lose to: both sides are ~$1.
-//
+// Mid token round-tripped each cycle. A stable leg is far cheaper than a
+// volatile one (no drift over the hold), and tagged volume is credited on
+// the USD input leg regardless of which asset moved.
 const DIRECT_DCA_TOKEN = (process.env.DIRECT_DCA_TOKEN as TokenSymbol) || "USDT";
-// Owner-set: each leg is PINNED to one venue rather than taking whichever
-// quotes higher at the time. Both are Uniswap's 0.01% pool, which measured
-// better on BOTH directions across every size from $10 to $330 (-5.93bps
-// going in, 7.93bps coming back, flat with size — the cost is a fixed peg
-// offset, not slippage). Mento does win USDT->USDm sometimes; the two flip
-// by around a basis point, and pinning knowingly gives that up in exchange
-// for a deterministic route. Both venues score tagged volume identically
-// (the operator EOA is tx_from either way), so this is a routing choice
-// only. A pin is ignored just when that venue has no route at all, which is
-// logged rather than silently swallowed.
+// Each leg is pinned to one venue (Uniswap's 0.01% pool measured cheapest
+// both directions). A pin is ignored only when that venue has no route,
+// which is logged rather than silently swallowed.
 const DIRECT_DCA_BUY_VENUE = "uniswap" as const; // USDm -> DIRECT_DCA_TOKEN
 const DIRECT_DCA_SELL_VENUE = "uniswap" as const; // DIRECT_DCA_TOKEN -> USDm
-const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute — the real cadence, independent of the heartbeat
-// MIN == MAX makes every cycle a fixed round trip: the exit becomes eligible
-// and forced on the same tick, so the take-profit test below never gates
-// anything and DIRECT_DCA_PROFIT_BPS only labels the log line. Deliberate —
-// it maximizes turnover, at the cost of paying the ~2bp round trip every
-// cycle instead of waiting for green quotes. Set MAX above MIN to get the
-// price selectivity back.
-//
-// At 1, a cycle is buy-then-sell-then-wait-for-the-minute: the sell lands on
-// the tick after the buy and the next buy is gated by DIRECT_DCA_INTERVAL_MS,
-// so the whole float round-trips once a minute. That is the throughput
-// ceiling for a given float, and it makes the hold backstop irrelevant in
-// normal operation — it only matters if a buy fails and the count lags.
+const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute
+// MIN == MAX makes every cycle a fixed round trip (exit eligible and forced
+// on the same tick), maximizing turnover at the cost of paying the round
+// trip every cycle. Set MAX above MIN to restore price selectivity.
 const DIRECT_DCA_MIN_BUYS = 1; // exit becomes eligible at this many buys
 const DIRECT_DCA_MAX_BUYS = 1; // ...and is forced regardless of price at this many
 const DIRECT_DCA_MAX_HOLD_MS = 5 * 60 * 1000; // wall-clock backstop, if a buy fails and the count lags
-const DIRECT_DCA_PROFIT_BPS = 5; // margin over cost basis a voluntary exit must clear (see MIN/MAX note)
+const DIRECT_DCA_PROFIT_BPS = 5; // margin over cost basis a voluntary exit must clear
 const DIRECT_MAX_SLIPPAGE_BPS = 100;
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
 
-const DCA_AMOUNT_HUMAN = 2; // fixed USDm spend per DCA buy, per the product spec
-const DCA_INTERVAL_MS = 1 * 60 * 1000; // per-pair buy cadence (owner-set; rebalance cadence is the heartbeat itself)
+const DCA_AMOUNT_HUMAN = 2; // fixed USDm spend per DCA buy
+const DCA_INTERVAL_MS = 1 * 60 * 1000; // per-pair buy cadence
 const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
-  // G$ was dropped from DCA (and the app's default token set): no Mento
-  // exchange and no Uniswap v3 pool at any fee tier ever quoted a route,
-  // so every buy attempt just logged a no-route skip.
-  { tokenIn: "USDm", tokenOut: "CELO" },
+  { tokenIn: "USDm", tokenOut: "CELO" }, // G$ dropped: no Mento/Uniswap route ever quoted
 ];
 
-// Exit design, after two live corrections: a buy count is a MINIMUM
-// accumulation gate, never a trigger. (A count-as-trigger forced selling on
-// a schedule regardless of price — spread bleed; no count at all made one
-// buy "inventory" and exits fired every other tick — churn with no
-// accumulation.) An exit now requires BOTH enough accumulated buys AND a
-// favorable price; only the bounded force triggers below override the
-// price check, and a funding-short replenish overrides everything.
-const REBALANCE_MIN_BUYS = 3; // rebalance: accumulate at least this many buys before considering an exit
-const DCA_MIN_BUYS = 10; // dca: accumulate at least this many buys before considering an exit
-const PROFIT_TARGET_BPS = 10; // voluntary exits require the quote to beat the inventory's USDm cost basis by this margin
-const REFILL_TRADES = 5; // funding-short exits sell only enough inventory to fund about this many forward trades
+// A buy count is a minimum accumulation gate, not a trigger: an exit needs
+// both enough accumulated buys AND a favorable price. The bounded force
+// triggers below override the price check; a funding-short replenish
+// overrides everything.
+const REBALANCE_MIN_BUYS = 3; // rebalance: min buys before considering an exit
+const DCA_MIN_BUYS = 10; // dca: min buys before considering an exit
+const PROFIT_TARGET_BPS = 10; // voluntary exits must beat the inventory's USDm cost basis by this
+const REFILL_TRADES = 5; // funding-short exits sell only enough to fund ~this many forward trades
 const MAX_HOLD_MS = 20 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
-const MAX_EXIT_REVERTS = 3; // stop waiting after this many actual exit attempts reverted since the last settled one
+const MAX_EXIT_REVERTS = 3; // stop waiting after this many reverted exit attempts since the last settled one
 
-// The 24h buy-on-Squid / sell-on-Uniswap experiment (owner-requested, to
-// settle a disagreement between API round-trip quotes — which say this
-// combination loses ~4.5%/trip — and manual frontend checks that suggested
-// it's profitable). Sized and paced so 24h of running settles the question
-// for a couple of dollars either way rather than draining the vault:
-// 1 USDm per trip, one trip per 30 minutes, realized P&L logged per trip.
-const ARB_AMOUNT_HUMAN = 1;
+// Arbitrage: buy CELO on Squid, sell on Uniswap, $20 per round trip, one
+// trip per 30 minutes. Realized round-trip P&L is logged per trip.
+const ARB_AMOUNT_HUMAN = 20;
 const ARB_INTERVAL_MS = 30 * 60 * 1000;
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
@@ -168,17 +101,11 @@ const FACTORY_ABI = [
 ] as const;
 
 /**
- * Enumerates every vault the factory has ever created (vaultCount/allVaults
- * — cheap contract reads, no event-log block-range scanning needed) and
- * upserts a User record for any vault whose owner isn't already in the DB,
- * or whose DB record points at the wrong vault. This makes the DB sync
- * independent of the frontend's best-effort POST /api/vault call, which has
- * no delivery guarantee at all — a closed tab, a network blip, or a silent
- * failure there previously left a real, funded vault permanently invisible
- * to the worker until someone noticed and fixed it by hand (twice, in
- * testing). Runs every tick; fine at hackathon scale (a full rescan is a
- * couple of cheap reads per vault), would want an incremental/cached
- * approach if this ever needs to handle thousands of vaults.
+ * Enumerates every vault the factory created (via vaultCount/allVaults) and
+ * upserts a User record for any vault missing from or mismatched in the DB.
+ * Keeps the DB sync independent of the frontend's best-effort POST /api/vault,
+ * which could otherwise leave a funded vault invisible to the worker. Runs
+ * every tick — fine at hackathon scale; would need caching for thousands of vaults.
  */
 async function reconcileVaultsFromChain() {
   if (!FACTORY_ADDRESS) return;
@@ -197,13 +124,10 @@ async function reconcileVaultsFromChain() {
   }
 }
 
-// Dogfood the product's own paid API surface: each internal check also
-// pings the deployed x402 check endpoint as an ordinary client. Sent
-// UNPAID on purpose — the endpoint answers with its 402 payment challenge
-// and nothing settles, so this counts for nothing on any leaderboard; it
-// exercises the real request path the trial's metered fees will settle
-// through later. Strictly fire-and-forget: short timeout, every error
-// swallowed, never awaited by trading logic.
+// Dogfood the paid x402 check endpoint on each internal check. Sent unpaid
+// (the endpoint answers with its 402 challenge, nothing settles), so it
+// counts for nothing — just exercises the real request path. Strictly
+// fire-and-forget: short timeout, errors swallowed, never awaited.
 const X402_CHECK_URL = process.env.VOMIA_X402_CHECK_URL || "https://vomiaagent.vercel.app/api/x402/check";
 function pingX402Check(tokenIn: string, tokenOut: string, amountIn: number): void {
   const controller = new AbortController();
@@ -215,12 +139,9 @@ function pingX402Check(tokenIn: string, tokenOut: string, amountIn: number): voi
 
 let ticking = false;
 
-
-
-/** Buys since the most recent reverse trade: how many, their total tokenIn
- * spend (the inventory's cost basis, raw units), the total tokenOut they
- * bought (quoted, so within slippage of what actually landed), and the oldest
- * buy's age. */
+/** Buys since the most recent reverse trade: count, total tokenIn spend (the
+ * inventory's cost basis, raw units), total tokenOut bought (quoted), and the
+ * oldest buy's age. */
 async function forwardsSinceLastReverse(
   userId: string,
   tokenIn: TokenSymbol,
@@ -250,20 +171,12 @@ async function forwardsSinceLastReverse(
 }
 
 /**
- * If this user has hit the cycle limit for tokenIn->tokenOut, swaps the
- * vault's current tokenOut balance back to tokenIn (unconditional, same as
- * DCA — this is housekeeping to prevent exhaustion, not a profit-gated
- * trade) and returns true so the caller skips its normal forward-trade
- * logic for this pair this tick. Returns false if not due, or if there's
- * nothing to cycle back.
- *
- * The amount is clamped to the vault's own on-chain caps (maxSingleTrade
- * and remainingDailyAllowance) — without this, an accumulated balance
- * above the per-trade cap made every cycle-back attempt revert with
- * OverSingleTradeCap, then retry the identical doomed swap every tick,
- * burning operator gas each time (observed live: a 146-CELO balance
- * against a 50/trade cap). Clamped cycle-backs drain the balance in
- * cap-sized chunks across successive ticks instead.
+ * If this user is due to exit tokenIn->tokenOut, swaps the vault's tokenOut
+ * balance back to tokenIn and returns true so the caller skips its forward
+ * trade this tick. Returns false if not due or nothing to cycle back. The
+ * amount is clamped to the vault's on-chain caps (maxSingleTrade,
+ * remainingDailyAllowance) so an over-cap balance drains in chunks across
+ * ticks instead of reverting every tick.
  */
 async function cycleBackIfDue(
   user: any,
@@ -274,14 +187,9 @@ async function cycleBackIfDue(
   maxSlippageBps: number,
   neededIn: bigint
 ): Promise<boolean> {
-  // Two triggers: the scheduled one (N forward buys since the last
-  // reverse), and a funding-short one — if the vault can no longer cover
-  // the next forward trade's tokenIn amount, cycle back early to replenish
-  // rather than letting every forward attempt fail on the token transfer
-  // (observed live: USDm drained to 0.13 while the accumulated value sat
-  // in KESm/NGNm/EURm, and every 10-USDm attempt reverted with
-  // "SafeERC20: low-level call failed" until a scheduled cycle-back
-  // happened to come around).
+  // Two triggers: scheduled (N forward buys since the last reverse) and
+  // funding-short (the vault can't cover the next forward trade's tokenIn,
+  // so cycle back early to replenish instead of failing every forward attempt).
   const { count: forwardCount, totalIn: costBasis, oldestAt } = await forwardsSinceLastReverse(user._id.toString(), tokenIn, tokenOut);
   const balanceIn = await publicClient.readContract({
     address: user.vaultAddress as Address,
@@ -320,12 +228,11 @@ async function cycleBackIfDue(
     return false;
   }
 
-  // Cost-basis exit (owner-requested): a voluntary exit must return MORE
-  // USDm than the inventory actually cost, plus PROFIT_TARGET_BPS — a
-  // take-profit against the position's own entry prices, not against the
-  // oracle. The force triggers (max hold, repeated reverted exits) still
-  // override so a falling market can't trap capital forever; those exits
-  // can realize losses, which is the accepted price of never being stuck.
+  // Cost-basis exit: a voluntary exit must return more USDm than the
+  // inventory cost, plus PROFIT_TARGET_BPS (take-profit against the
+  // position's own entry prices). Force triggers (max hold, repeated
+  // reverted exits) override so capital can't be trapped, at the cost of
+  // possibly realizing a loss.
   if (scheduled) {
     const [bestQuote, revertedReverses] = await Promise.all([
       Promise.all([
@@ -415,13 +322,10 @@ async function hasFunding(user: any, tokenIn: TokenSymbol, amountIn: bigint): Pr
 }
 
 async function runRebalance(user: any, profile: any) {
-  // CELO-only by default, based on 36h of realized results (1,804 settled
-  // trades): CELO's entry edges are genuine (its price actually moves, so
-  // the pool briefly lags fair value ~400x/day) and its spread is the
-  // tightest, netting -0.79% of turnover vs -1.3% to -2.3% on KESm/NGNm/
-  // EURm — whose large quoted "edges" (avg +180..290bps) were mostly
-  // oracle staleness, not capturable dislocations. Regional pairs can
-  // still be enabled per-user via profile.allowedTokenPairs.
+  // CELO-only by default: its entry edges are genuine (price moves, pool
+  // briefly lags fair value) and its spread is tightest. Regional pairs had
+  // large quoted edges that were mostly oracle staleness; they can still be
+  // enabled per-user via profile.allowedTokenPairs.
   const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = profile.allowedTokenPairs?.length
     ? profile.allowedTokenPairs
     : [{ tokenIn: "USDm", tokenOut: "CELO" }];
@@ -503,9 +407,8 @@ async function runArbitrage(user: any, profile: any) {
   console.log(`${tag} leg1 USDm->CELO via squid: ${leg1.status}` + (leg1.txHash ? ` tx=${leg1.txHash}` : "") + ` (${leg1.reason})`);
   if (leg1.status !== "settled") return;
 
-  // Leg 2: sell the vault's whole CELO balance on Uniswap (the vault held 0
-  // CELO before leg 1 on this strategy's vault; selling the full balance
-  // keeps the experiment's books clean between trips).
+  // Leg 2: sell the vault's whole CELO balance on Uniswap (starts each trip
+  // at 0 CELO, so selling the full balance keeps the books clean between trips).
   const celoBalance = await publicClient.readContract({
     address: user.vaultAddress as Address,
     abi: VAULT_BALANCE_ABI,
@@ -532,28 +435,14 @@ async function runArbitrage(user: any, profile: any) {
 }
 
 /**
- * DCA on the operator EOA's OWN balance (USDm -> DIRECT_DCA_TOKEN and back).
- * This is the only shape of trade that scores Track 1 tagged volume: tx_from
- * == the token sender, so the input leg is credited at full USD value. A
- * vault trade never can be — a contract is never tx_from.
- *
- * The schedule, owner-set: buy DIRECT_DCA_USDM of the mid token once a
- * minute, price-independent (that is what makes it DCA rather than the
- * rebalance strategy), then sell the lot back to USDm at DIRECT_DCA_MAX_BUYS.
- * At the current 3 buys that is a three-minute cycle — three buys a minute
- * apart, the sell on the tick after the third — so roughly 480 cycles and
- * ~2,880 * DIRECT_DCA_USDM of tagged volume per day.
- *
- * The float has to cover DIRECT_DCA_MAX_BUYS * DIRECT_DCA_USDM or the cycle
- * ends early on the funding-short trigger below; anything above that sits
- * idle, so the two numbers should be set together.
- *
- * The sell is capped at what the logged buys since the last exit actually
- * accumulated, rather than the whole balance: any pre-existing holding was
- * never bought at one of this cycle's prices, so including it would skew the
- * cost-basis check (and, when the leg is CELO, spend the gas float).
- *
- * One action per tick, each awaiting its receipt, to keep nonces serial.
+ * DCA on the operator EOA's own balance (USDm -> DIRECT_DCA_TOKEN and back) —
+ * the only trade shape that scores tagged volume, since tx_from is the token
+ * sender (a vault contract never is). Buys DIRECT_DCA_USDM of the mid token
+ * once a minute, price-independent, then sells the lot back at
+ * DIRECT_DCA_MAX_BUYS. The float must cover DIRECT_DCA_MAX_BUYS *
+ * DIRECT_DCA_USDM. The sell is capped at the buys accumulated since the last
+ * exit (not the whole balance) so a pre-existing holding doesn't skew the
+ * cost-basis check. One action per tick, awaiting each receipt, to keep nonces serial.
  */
 async function runDirectDca() {
   const { id: uid, address } = await ensureOperatorUser();
@@ -564,15 +453,12 @@ async function runDirectDca() {
   const [usdm, midBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance(mid)]);
   const { count, totalIn: costBasis, totalOut: inventory, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", mid);
 
-  // ---- EXIT: sell the cycle's inventory back to USDm. Eligible at
-  // DIRECT_DCA_MIN_BUYS, OR as soon as the wallet can't fund the next buy —
-  // on a float under DIRECT_DCA_USDM * DIRECT_DCA_MIN_BUYS the cycle just
-  // ends short. Without that second trigger the loop deadlocks: no USDm left
-  // to buy with, and a buy count permanently below the exit gate, so it would
-  // sit there logging skips forever.
-  //
-  // The exit is taken if it beats cost basis + DIRECT_DCA_PROFIT_BPS, and is
-  // forced regardless of price at DIRECT_DCA_MAX_BUYS or the hold cap. ----
+  // EXIT: sell the cycle's inventory back to USDm. Eligible at
+  // DIRECT_DCA_MIN_BUYS or as soon as the wallet can't fund the next buy
+  // (the out-of-funds trigger avoids a deadlock when the float is under
+  // DIRECT_DCA_USDM * DIRECT_DCA_MIN_BUYS). Taken if it beats cost basis +
+  // DIRECT_DCA_PROFIT_BPS; forced regardless of price at DIRECT_DCA_MAX_BUYS
+  // or the hold cap.
   const outOfFunds = usdm < amountIn;
   if ((count >= DIRECT_DCA_MIN_BUYS || outOfFunds) && inventory > 0n) {
     // Only CELO doubles as the gas token, so only CELO needs a reserve held
@@ -611,9 +497,9 @@ async function runDirectDca() {
     }
   }
 
-  // ---- BUY: DIRECT_DCA_USDM of the mid token, once a minute,
-  // price-independent. Gated on the last buy's timestamp rather than on the
-  // tick, so the cadence stays a real minute whatever HEARTBEAT_SECONDS is. ----
+  // BUY: DIRECT_DCA_USDM of the mid token once a minute, price-independent.
+  // Gated on the last buy's timestamp, not the tick, so the cadence stays a
+  // real minute whatever HEARTBEAT_SECONDS is.
   if (outOfFunds) {
     console.log(`${tag} dca skipped — operator USDm ${(Number(usdm) / 1e18).toFixed(2)} is below the ${DIRECT_DCA_USDM} buy size and there is no inventory to sell. Top the wallet up.`);
     return;
@@ -647,9 +533,8 @@ async function tick() {
     console.log(`Found ${users.length} user(s) with a vault.`);
 
     for (const user of users) {
-      // Per-user isolation: a single bad user row (e.g. a non-contract
-      // vaultAddress that makes tokenBalance() throw) must never abort the
-      // whole tick and halt everyone else's trading, as it once did.
+      // Per-user isolation: one bad user row must never abort the whole
+      // tick and halt everyone else's trading.
       try {
         const profile = (await RiskProfile.findOne({ userId: user._id })) ?? DEFAULT_RISK_PROFILE;
         if ((profile as any).paused) {
@@ -659,9 +544,8 @@ async function tick() {
 
         const strategies: string[] = profile.enabledStrategies?.length ? profile.enabledStrategies : DEFAULT_RISK_PROFILE.enabledStrategies;
 
-        // Self-enforced daily trade budget (the vault separately enforces
-        // token-unit caps on-chain; this one is about count), shared across
-        // whichever strategies this user has enabled.
+        // Self-enforced daily trade-count budget, shared across the user's
+        // enabled strategies (the vault separately enforces token-unit caps on-chain).
         const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const tradesToday = await TradeLog.countDocuments({
           userId: user._id,
@@ -691,12 +575,9 @@ async function tick() {
 
 async function start() {
   console.log(`Vomia worker starting. Heartbeat: ${HEARTBEAT_SECONDS}s, scan size: ${SCAN_AMOUNT_HUMAN} units.`);
-  // Mongoose doesn't alter existing indexes on a live collection just
-  // because the schema changed — a stale unique index on the old
-  // web3AuthSub field (since made optional) was still rejecting any second
-  // user record without one. Sync once at startup so the live indexes
-  // always match the current schema, instead of needing a one-off manual
-  // fix every time a schema constraint changes.
+  // Sync indexes at startup: Mongoose won't alter existing indexes on a live
+  // collection when the schema changes, so a stale index can otherwise reject
+  // valid writes.
   await connectDB();
   await User.syncIndexes();
   await RiskProfile.syncIndexes();

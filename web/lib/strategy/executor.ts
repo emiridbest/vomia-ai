@@ -1,20 +1,13 @@
 /**
- * Takes a scanner decision and, if it says "execute", actually calls
- * AgentVault.executeSwap using the operator key. This is the only file in
- * the whole strategy layer that signs and sends a transaction — keeping it
- * isolated makes it the one place to audit for "does this respect the
- * vault's own on-chain limits" (short answer: it doesn't have to try very
- * hard, because the contract enforces its caps regardless of what this
- * code sends — see AgentVault.sol. This file's job is picking a *good*
- * trade; the contract's job is refusing a *dangerous* one, even if this
- * code has a bug.)
+ * Calls AgentVault.executeSwap with the operator key — the only file in the
+ * strategy layer that signs and sends a transaction. The vault contract
+ * enforces its own caps regardless of what this code sends; this file's job
+ * is picking a good trade, the contract's is refusing a dangerous one.
  *
- * Two entry points, two different gates:
- *   - executeIfProfitable (rebalance): only executes if the scanner found an
- *     edge above the user's minProfitBps.
- *   - executeDca: never gated on profit — DCA buys on a fixed schedule by
- *     definition, regardless of price. It still requires a real venue quote
- *     (for slippage protection) and still won't execute with no route.
+ * Entry points: executeIfProfitable (rebalance, gated on minProfitBps),
+ * executeDca (unconditional fixed-schedule buys), and executeVenueSwap (a
+ * single arbitrage leg on a specific venue). All still require a real venue
+ * quote for slippage protection.
  */
 import { v4 as uuidv4 } from "uuid";
 import { createPublicClient, encodeFunctionData, http, keccak256, toBytes, type Address } from "viem";
@@ -84,14 +77,11 @@ async function sendTaggedSwap(params: {
   const actionId = keccak256(toBytes(uuidv4()));
   const walletClient = getOperatorWalletClient();
 
-  // The tag has to ride on THIS (outer) transaction's own calldata, not on
-  // params.callData — that's the inner router call, passed as a `bytes`
-  // argument to executeSwap, so a tag appended there ends up ABI-padded
-  // mid-calldata rather than at the true tail any real indexer checks
-  // (confirmed: the official package's own verifyTx() couldn't find a tag
-  // placed that way). Encode the untagged call fully first, tag the
-  // result, then send as a raw transaction — writeContract does its own
-  // encoding internally and won't let us append bytes after it.
+  // The tag must ride on this outer tx's own calldata tail, not on
+  // params.callData (the inner router call, an ABI `bytes` arg — a tag there
+  // lands mid-calldata where verifyTx won't find it). Encode the untagged
+  // call, tag the result, then send raw (writeContract won't let us append
+  // bytes after its own encoding).
   const untaggedData = encodeFunctionData({
     abi: AGENT_VAULT_EXECUTE_ABI,
     functionName: "executeSwap",
@@ -115,21 +105,17 @@ async function sendTaggedSwap(params: {
       account: walletClient.account!,
     });
 
-    // Wait for the receipt before returning. This is what serializes
-    // same-tick trades: every strategy awaits this function, so the next
-    // send only fetches its nonce after this transaction has mined —
-    // without it, a tick that fired several trades had all but the first
-    // collide with "replacement transaction underpriced" (observed live:
-    // a +124bps trade lost to a nonce race, not to the market). It also
-    // makes the logged status the real on-chain outcome instead of an
-    // optimistic "submitted".
+    // Await the receipt before returning: this serializes same-tick trades
+    // (the next send only fetches its nonce after this one mines, avoiding
+    // "replacement transaction underpriced" races) and makes the logged
+    // status the real on-chain outcome.
     let status: "submitted" | "settled" | "reverted" = "submitted";
     try {
       const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
       status = receipt.status === "success" ? "settled" : "reverted";
     } catch {
-      // Receipt didn't arrive within the timeout — the tx may still mine;
-      // leave it recorded as submitted rather than guessing an outcome.
+      // Receipt didn't arrive within the timeout — leave it as submitted
+      // rather than guessing an outcome.
     }
 
     await TradeLog.create({
@@ -210,8 +196,8 @@ export async function executeIfProfitable(
       amountOutMin: minAmountOut,
     });
   } else {
-    // Re-quote to learn WHICH fee tier won — the swap must target the same
-    // pool the quote came from, not a hardcoded 0.3% tier.
+    // Re-quote to learn which fee tier won — the swap must target the pool
+    // the quote came from, not a hardcoded tier.
     const best = await getBestUniswapQuote(scan.tokenIn, scan.tokenOut, scan.amountIn);
     if (!best) {
       return { status: "skipped-no-route", actionId: keccak256(toBytes(uuidv4())), reason: "Uniswap route disappeared between quote and execute — skipping this tick." };
@@ -244,15 +230,10 @@ export async function executeIfProfitable(
 }
 
 /**
- * Executes a swap unconditionally — no profit check. Used by two callers
- * with different intents but identical safety requirements:
- *   - the worker's DCA loop (strategy: "dca"), which buys on a fixed
- *     schedule by definition, regardless of price
- *   - the chat agent's on-demand swap tool (strategy: "rebalance"), for
- *     when a user explicitly asks to convert tokens inside their vault
- *     right now
- * Either way this still requires a real quote from at least one venue (for
- * slippage protection) and still won't execute if nothing has a route.
+ * Executes a swap unconditionally (no profit check). Used by the worker's DCA
+ * loop (strategy: "dca") and the chat agent's on-demand swap tool
+ * (strategy: "rebalance"). Still requires a real venue quote for slippage
+ * protection and won't execute with no route.
  */
 export async function executeDca(
   vaultAddress: Address,
@@ -348,11 +329,9 @@ export async function executeDca(
 }
 
 /**
- * One leg of the buy-on-Squid / sell-on-Uniswap arbitrage experiment —
- * executes on a SPECIFIC venue (no best-venue selection), unconditionally
- * (no profit gate; the whole point of the experiment is to measure the
- * realized round trip), with the user's slippage tolerance still applied
- * against the venue's own quote.
+ * One arbitrage leg — executes on a specific venue (no best-venue selection),
+ * unconditionally (no profit gate), with the user's slippage tolerance still
+ * applied against the venue's own quote.
  */
 export async function executeVenueSwap(
   venue: "squid" | "uniswap",

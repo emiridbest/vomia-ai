@@ -1,22 +1,10 @@
 /**
- * Operator-wallet DIRECT trading.
- *
- * Why this exists: Track 1 tagged volume is attributed to transfer legs whose
- * `from` equals the transaction sender (tx_from). A vault-mediated trade can
- * NEVER satisfy that — a contract is never tx_from, so `executeSwap` txs
- * (sent by the operator EOA, tokens moving from the vault contract) score
- * zero tagged volume no matter how many run. Here the operator EOA swaps its
- * OWN balance directly on Mento/Uniswap: tx_from == the operator == the token
- * sender, so the input transfer leg is credited at full USD value.
- *
- * The ERC-8021 tag rides on the DEX call's own calldata tail (Broker.swapIn /
- * Router.exactInputSingle ignore trailing bytes), which is the true tail of
- * tx.input — exactly where verifyTx looks. No wrapper, so no ABI padding
- * problem like the vault path had.
- *
- * This is custodial for the operator's own working balance (the funds sit in
- * an EOA, not the non-custodial vault) — a deliberate, hackathon-scoped
- * choice for leaderboard volume, separate from the vault product.
+ * Operator-wallet DIRECT trading. The operator EOA swaps its own balance on
+ * Mento/Uniswap so tx_from == the token sender, the only shape that scores
+ * tagged volume (a vault contract is never tx_from). The ERC-8021 tag rides on
+ * the DEX call's own calldata tail, where verifyTx looks. Custodial for the
+ * operator's working balance — a deliberate choice, separate from the
+ * non-custodial vault product.
  */
 import { encodeFunctionData, type Address } from "viem";
 import { getOperatorWalletClient, operatorAddress } from "../vault/operatorSigner";
@@ -91,9 +79,8 @@ async function ensureAllowance(token: Address, spender: Address, amount: bigint)
 export async function ensureOperatorUser(): Promise<{ id: string; address: Address }> {
   const address = operatorAddress();
   // Explicitly $unset vaultAddress: the operator EOA is a trader, never a
-  // vault. If it ever carries a vaultAddress, the per-vault loop tries to
-  // read tokenBalance() on an EOA (not a contract) and throws, which
-  // previously killed the whole tick.
+  // vault. A stray vaultAddress would make the per-vault loop call
+  // tokenBalance() on an EOA and throw, killing the tick.
   const user = await User.findOneAndUpdate(
     { walletAddress: address },
     { $set: { walletAddress: address }, $unset: { vaultAddress: "" } },
@@ -115,12 +102,9 @@ export async function executeDirectSwap(
   maxSlippageBps: number,
   strategy: "rebalance" | "dca",
   /**
-   * Pin this leg to one venue instead of taking whichever quotes higher.
-   * The pin is honoured even when the other venue is quoting better — that
-   * is the point of pinning, and the cost is real (the two flip on this pair
-   * by around a basis point). It is NOT honoured when the pinned venue has
-   * no route at all: falling back beats stalling the loop, and the fallback
-   * is logged loudly rather than silently.
+   * Pin this leg to one venue instead of taking the better quote. Honoured
+   * even when the other venue quotes better — except when the pinned venue
+   * has no route, where it falls back (logged loudly) rather than stall.
    */
   preferVenue?: "mento" | "uniswap"
 ): Promise<DirectResult> {
