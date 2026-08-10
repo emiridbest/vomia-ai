@@ -14,10 +14,10 @@ export interface RiskProfile {
 }
 
 export const DEFAULT_RISK_PROFILE: RiskProfile = {
-  minProfitBps: 5, // 0.05% net edge floor (below-gas floors were pure spread bleed at 1-minute holds)
+  minProfitBps: 25, // 0.25% net edge floor — chase real profit, not volume; only enter on a genuine edge
   maxSlippageBps: 100, // 1%
   maxTradesPerDay: 50,
-  enabledStrategies: ["arbitrage"],
+  enabledStrategies: ["rebalance", "arbitrage", "dca"],
 };
 
 export interface ProfileReview {

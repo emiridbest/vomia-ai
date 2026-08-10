@@ -43,6 +43,11 @@ export interface ScanResult {
  * not a live gas oracle; tighten it with a real estimate before trusting it
  * with meaningful size.
  */
+// Above this implied edge (vs. the oracle reference), a stable/regional pair's
+// quote is treated as a stale reference rather than a real opportunity. Real
+// capturable edges here are small; a triple-digit "edge" is a red flag.
+const MAX_PLAUSIBLE_EDGE_BPS = 150;
+
 function estimateGasBps(amountInUsd: number): number {
   const ESTIMATED_GAS_USD = 0.001; // Celo is consistently sub-cent per tx; pad generously anyway
   if (amountInUsd <= 0) return 10000; // avoid divide-by-zero; treat as "gas eats everything"
@@ -127,6 +132,24 @@ export async function scanPair(
   // Pure BigInt through the comparison so this never risks precision loss
   // converting large raw token amounts to a JS Number.
   const impliedEdgeBps = Number(((bestVenue.amountOut - referenceAmountOut) * 10000n) / referenceAmountOut);
+
+  // Safe entry: an implausibly large edge on a liquid stable/regional pair is
+  // almost always a stale oracle reference, not a real capturable dislocation
+  // (regional pairs like KESm/NGNm historically showed +180..290bps "edges"
+  // that lost money on execution). Refuse to enter above this ceiling rather
+  // than chase a phantom.
+  if (impliedEdgeBps > MAX_PLAUSIBLE_EDGE_BPS) {
+    return {
+      tokenIn,
+      tokenOut,
+      amountIn,
+      quotes,
+      bestVenue,
+      netEdgeBps: impliedEdgeBps,
+      decision: "skip-below-margin",
+      reason: `Implied edge ${impliedEdgeBps}bps exceeds the ${MAX_PLAUSIBLE_EDGE_BPS}bps plausibility ceiling — treating it as a stale reference rate, not a real edge, and not entering.`,
+    };
+  }
 
   const gasBps = estimateGasBps(amountInUsdEstimate);
   const edge = netEdgeBps(impliedEdgeBps, 0, gasBps);

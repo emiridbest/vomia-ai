@@ -70,15 +70,18 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 // overrides everything.
 const REBALANCE_MIN_BUYS = 3; // rebalance: min buys before considering an exit
 const DCA_MIN_BUYS = 10; // dca: min buys before considering an exit
-const PROFIT_TARGET_BPS = 10; // voluntary exits must beat the inventory's USDm cost basis by this
+const PROFIT_TARGET_BPS = 25; // safe exit: only take a voluntary exit that beats the inventory's USDm cost basis by this
 const REFILL_TRADES = 5; // funding-short exits sell only enough to fund ~this many forward trades
-const MAX_HOLD_MS = 20 * 60 * 1000; // never hold inventory longer than this waiting for a good exit
-const MAX_EXIT_REVERTS = 3; // stop waiting after this many reverted exit attempts since the last settled one
+const MAX_HOLD_MS = 6 * 60 * 60 * 1000; // wait up to this long for a green exit before force-selling (safe exit: rarely realize a loss)
+const MAX_EXIT_REVERTS = 5; // stop waiting after this many reverted exit attempts since the last settled one
 
-// Arbitrage: buy CELO on Squid, sell on Uniswap, $20 per round trip, one
-// trip per 30 minutes. Realized round-trip P&L is logged per trip.
+// Arbitrage: round-trip a stablecoin (buy on Squid, sell on Uniswap), $20 per
+// trip, one trip per pair per 30 minutes. A stable leg has no price drift over
+// the hold, so realized P&L is purely the cross-venue spread. Realized
+// round-trip P&L is logged per trip.
 const ARB_AMOUNT_HUMAN = 20;
 const ARB_INTERVAL_MS = 30 * 60 * 1000;
+const ARB_STABLE_MIDS: TokenSymbol[] = ["USDT", "USDC"]; // stablecoins round-tripped against USDm
 
 const publicClient = createPublicClient({ chain: celo, transport: http(rpcUrl()) });
 const VAULT_BALANCE_ABI = [
@@ -322,10 +325,10 @@ async function hasFunding(user: any, tokenIn: TokenSymbol, amountIn: bigint): Pr
 }
 
 async function runRebalance(user: any, profile: any) {
-  // CELO-only by default: its entry edges are genuine (price moves, pool
-  // briefly lags fair value) and its spread is tightest. Regional pairs had
-  // large quoted edges that were mostly oracle staleness; they can still be
-  // enabled per-user via profile.allowedTokenPairs.
+  // CELO-only by default: its entry edges are genuine (price moves, the pool
+  // briefly lags fair value) and its spread is tightest, so it's the pair
+  // worth chasing real profit on. Overridable per-user via
+  // profile.allowedTokenPairs.
   const pairs: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = profile.allowedTokenPairs?.length
     ? profile.allowedTokenPairs
     : [{ tokenIn: "USDm", tokenOut: "CELO" }];
@@ -390,47 +393,49 @@ async function runDca(user: any, profile: any) {
 }
 
 async function runArbitrage(user: any, profile: any) {
-  const tag = `[${user.walletAddress.slice(0, 8)}] arb`;
-
-  // One trip per interval, gated on the last arbitrage-strategy trade.
-  const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "arbitrage" }).sort({ createdAt: -1 });
-  if (lastRun && Date.now() - lastRun.createdAt.getTime() < ARB_INTERVAL_MS) return;
-
   const amountIn = BigInt(ARB_AMOUNT_HUMAN) * 10n ** BigInt(TOKENS.USDm.decimals);
-  if (!(await hasFunding(user, "USDm", amountIn))) {
-    console.log(`${tag}: skipped — vault can't fund ${ARB_AMOUNT_HUMAN} USDm.`);
-    return;
-  }
 
-  // Leg 1: buy CELO on Squid.
-  const leg1 = await executeVenueSwap("squid", user.vaultAddress, user._id.toString(), "USDm", "CELO", amountIn, profile.maxSlippageBps);
-  console.log(`${tag} leg1 USDm->CELO via squid: ${leg1.status}` + (leg1.txHash ? ` tx=${leg1.txHash}` : "") + ` (${leg1.reason})`);
-  if (leg1.status !== "settled") return;
+  for (const mid of ARB_STABLE_MIDS) {
+    const tag = `[${user.walletAddress.slice(0, 8)}] arb USDm<->${mid}`;
 
-  // Leg 2: sell the vault's whole CELO balance on Uniswap (starts each trip
-  // at 0 CELO, so selling the full balance keeps the books clean between trips).
-  const celoBalance = await publicClient.readContract({
-    address: user.vaultAddress as Address,
-    abi: VAULT_BALANCE_ABI,
-    functionName: "tokenBalance",
-    args: [TOKENS.CELO.address],
-  });
-  if (celoBalance === 0n) {
-    console.log(`${tag} leg2: nothing to sell (CELO balance 0 after leg 1?)`);
-    return;
-  }
-  const leg2 = await executeVenueSwap("uniswap", user.vaultAddress, user._id.toString(), "CELO", "USDm", celoBalance, profile.maxSlippageBps);
-  console.log(`${tag} leg2 CELO->USDm via uniswap: ${leg2.status}` + (leg2.txHash ? ` tx=${leg2.txHash}` : "") + ` (${leg2.reason})`);
+    // One trip per pair per interval, gated on this pair's last buy leg.
+    const lastRun = await TradeLog.findOne({ userId: user._id, strategy: "arbitrage", tokenIn: "USDm", tokenOut: mid }).sort({ createdAt: -1 });
+    if (lastRun && Date.now() - lastRun.createdAt.getTime() < ARB_INTERVAL_MS) continue;
 
-  // Realized round-trip P&L, from the vault's own USDm balance movement.
-  if (leg2.status === "settled") {
-    const usdmAfter = await publicClient.readContract({
+    if (!(await hasFunding(user, "USDm", amountIn))) {
+      console.log(`${tag}: skipped — vault can't fund ${ARB_AMOUNT_HUMAN} USDm.`);
+      continue;
+    }
+
+    // Leg 1: buy the stablecoin on Squid.
+    const leg1 = await executeVenueSwap("squid", user.vaultAddress, user._id.toString(), "USDm", mid, amountIn, profile.maxSlippageBps);
+    console.log(`${tag} leg1 USDm->${mid} via squid: ${leg1.status}` + (leg1.txHash ? ` tx=${leg1.txHash}` : "") + ` (${leg1.reason})`);
+    if (leg1.status !== "settled") continue;
+
+    // Leg 2: sell the whole balance of that stablecoin back on Uniswap.
+    const midBalance = await publicClient.readContract({
       address: user.vaultAddress as Address,
       abi: VAULT_BALANCE_ABI,
       functionName: "tokenBalance",
-      args: [TOKENS.USDm.address],
+      args: [TOKENS[mid].address],
     });
-    console.log(`${tag} round trip complete — vault USDm now ${(Number(usdmAfter) / 1e18).toFixed(6)} (spent ${ARB_AMOUNT_HUMAN} USDm on leg 1).`);
+    if (midBalance === 0n) {
+      console.log(`${tag} leg2: nothing to sell (${mid} balance 0 after leg 1?)`);
+      continue;
+    }
+    const leg2 = await executeVenueSwap("uniswap", user.vaultAddress, user._id.toString(), mid, "USDm", midBalance, profile.maxSlippageBps);
+    console.log(`${tag} leg2 ${mid}->USDm via uniswap: ${leg2.status}` + (leg2.txHash ? ` tx=${leg2.txHash}` : "") + ` (${leg2.reason})`);
+
+    // Realized round-trip P&L, from the vault's own USDm balance movement.
+    if (leg2.status === "settled") {
+      const usdmAfter = await publicClient.readContract({
+        address: user.vaultAddress as Address,
+        abi: VAULT_BALANCE_ABI,
+        functionName: "tokenBalance",
+        args: [TOKENS.USDm.address],
+      });
+      console.log(`${tag} round trip complete — vault USDm now ${(Number(usdmAfter) / 1e18).toFixed(6)} (spent ${ARB_AMOUNT_HUMAN} USDm on leg 1).`);
+    }
   }
 }
 
