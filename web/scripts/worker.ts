@@ -31,7 +31,7 @@ import { rpcUrl } from "../lib/chains";
 // Operator-wallet DIRECT trading. Vault trades score zero tagged volume (a
 // contract is never tx_from), so when this is on the worker trades the
 // operator EOA's own balance directly. Fund it with USDm to trade + CELO for gas.
-const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "true";
+const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "false";
 const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
 // Buy size in USDm — the throughput lever (daily volume ~= 2,880 * this).
 // The wallet must hold DIRECT_DCA_MAX_BUYS * this; anything above sits idle.
@@ -69,7 +69,7 @@ const DCA_PAIRS: { tokenIn: TokenSymbol; tokenOut: TokenSymbol }[] = [
 // triggers below override the price check; a funding-short replenish
 // overrides everything.
 const REBALANCE_MIN_BUYS = 3; // rebalance: min buys before considering an exit
-const DCA_MIN_BUYS = 10; // dca: min buys before considering an exit
+const DCA_MIN_BUYS = 2; // dca: min buys before considering an exit
 const PROFIT_TARGET_BPS = 25; // safe exit: only take a voluntary exit that beats the inventory's USDm cost basis by this
 const REFILL_TRADES = 5; // funding-short exits sell only enough to fund ~this many forward trades
 const MAX_HOLD_MS = 6 * 60 * 60 * 1000; // wait up to this long for a green exit before force-selling (safe exit: rarely realize a loss)
@@ -79,7 +79,7 @@ const MAX_EXIT_REVERTS = 5; // stop waiting after this many reverted exit attemp
 // trip, one trip per pair per 30 minutes. A stable leg has no price drift over
 // the hold, so realized P&L is purely the cross-venue spread. Realized
 // round-trip P&L is logged per trip.
-const ARB_AMOUNT_HUMAN = 20;
+const ARB_AMOUNT_HUMAN = 5;
 const ARB_INTERVAL_MS = 30 * 60 * 1000;
 const ARB_STABLE_MIDS: TokenSymbol[] = ["USDT", "USDC"]; // stablecoins round-tripped against USDm
 
