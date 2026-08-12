@@ -6,9 +6,7 @@
  * Uniswap), rebalance (profit-gated cross-venue swaps), and dca (fixed
  * price-independent buys). Forward strategies are one-directional and
  * cycleBackIfDue() swaps accumulated balances back to USDm to avoid
- * exhaustion. When OPERATOR_DIRECT_TRADING is set the worker instead trades
- * the operator EOA's own balance (runDirectDca) — the only path that scores
- * Track 1 tagged volume, since a vault contract is never tx_from.
+ * exhaustion. All trading goes through each user's vault.
  *
  * The vault contract re-enforces every cap on-chain regardless of what this
  * code sends. Run as a single separate process (not the serverless app) so
@@ -23,37 +21,9 @@ import { getMentoQuote } from "../lib/dex/mento";
 import { getUniswapQuote } from "../lib/dex/uniswap";
 import { getReferenceAmountOut } from "../lib/dex/oracle";
 import { executeIfProfitable, executeDca, executeVenueSwap } from "../lib/strategy/executor";
-import { ensureOperatorUser, executeDirectSwap, operatorTokenBalance } from "../lib/strategy/directTrader";
 import { TOKENS, type TokenSymbol } from "../lib/tokens";
 import { DEFAULT_RISK_PROFILE } from "../lib/strategy/riskProfile";
 import { rpcUrl } from "../lib/chains";
-
-// Operator-wallet DIRECT trading. Vault trades score zero tagged volume (a
-// contract is never tx_from), so when this is on the worker trades the
-// operator EOA's own balance directly. Fund it with USDm to trade + CELO for gas.
-const OPERATOR_DIRECT_TRADING = process.env.OPERATOR_DIRECT_TRADING === "false";
-const GAS_RESERVE_CELO = 1n * 10n ** 18n; // always keep >= 1 CELO in the operator wallet for gas
-// Buy size in USDm — the throughput lever (daily volume ~= 2,880 * this).
-// The wallet must hold DIRECT_DCA_MAX_BUYS * this; anything above sits idle.
-const DIRECT_DCA_USDM = Number(process.env.DIRECT_DCA_USDM || 300);
-// Mid token round-tripped each cycle. A stable leg is far cheaper than a
-// volatile one (no drift over the hold), and tagged volume is credited on
-// the USD input leg regardless of which asset moved.
-const DIRECT_DCA_TOKEN = (process.env.DIRECT_DCA_TOKEN as TokenSymbol) || "USDT";
-// Each leg is pinned to one venue (Uniswap's 0.01% pool measured cheapest
-// both directions). A pin is ignored only when that venue has no route,
-// which is logged rather than silently swallowed.
-const DIRECT_DCA_BUY_VENUE = "uniswap" as const; // USDm -> DIRECT_DCA_TOKEN
-const DIRECT_DCA_SELL_VENUE = "uniswap" as const; // DIRECT_DCA_TOKEN -> USDm
-const DIRECT_DCA_INTERVAL_MS = 60 * 1000; // one buy per minute
-// MIN == MAX makes every cycle a fixed round trip (exit eligible and forced
-// on the same tick), maximizing turnover at the cost of paying the round
-// trip every cycle. Set MAX above MIN to restore price selectivity.
-const DIRECT_DCA_MIN_BUYS = 1; // exit becomes eligible at this many buys
-const DIRECT_DCA_MAX_BUYS = 1; // ...and is forced regardless of price at this many
-const DIRECT_DCA_MAX_HOLD_MS = 5 * 60 * 1000; // wall-clock backstop, if a buy fails and the count lags
-const DIRECT_DCA_PROFIT_BPS = 5; // margin over cost basis a voluntary exit must clear
-const DIRECT_MAX_SLIPPAGE_BPS = 100;
 
 const HEARTBEAT_SECONDS = Number(process.env.HEARTBEAT_SECONDS || 60);
 const SCAN_AMOUNT_HUMAN = Number(process.env.SCAN_AMOUNT_HUMAN || 10); // notional per-trade size to quote with
@@ -439,89 +409,6 @@ async function runArbitrage(user: any, profile: any) {
   }
 }
 
-/**
- * DCA on the operator EOA's own balance (USDm -> DIRECT_DCA_TOKEN and back) —
- * the only trade shape that scores tagged volume, since tx_from is the token
- * sender (a vault contract never is). Buys DIRECT_DCA_USDM of the mid token
- * once a minute, price-independent, then sells the lot back at
- * DIRECT_DCA_MAX_BUYS. The float must cover DIRECT_DCA_MAX_BUYS *
- * DIRECT_DCA_USDM. The sell is capped at the buys accumulated since the last
- * exit (not the whole balance) so a pre-existing holding doesn't skew the
- * cost-basis check. One action per tick, awaiting each receipt, to keep nonces serial.
- */
-async function runDirectDca() {
-  const { id: uid, address } = await ensureOperatorUser();
-  const tag = `[direct ${address.slice(0, 8)}]`;
-  const mid = DIRECT_DCA_TOKEN;
-  const midUnit = 10n ** BigInt(TOKENS[mid].decimals);
-  const amountIn = BigInt(DIRECT_DCA_USDM) * 10n ** BigInt(TOKENS.USDm.decimals);
-  const [usdm, midBal] = await Promise.all([operatorTokenBalance("USDm"), operatorTokenBalance(mid)]);
-  const { count, totalIn: costBasis, totalOut: inventory, oldestAt } = await forwardsSinceLastReverse(uid, "USDm", mid);
-
-  // EXIT: sell the cycle's inventory back to USDm. Eligible at
-  // DIRECT_DCA_MIN_BUYS or as soon as the wallet can't fund the next buy
-  // (the out-of-funds trigger avoids a deadlock when the float is under
-  // DIRECT_DCA_USDM * DIRECT_DCA_MIN_BUYS). Taken if it beats cost basis +
-  // DIRECT_DCA_PROFIT_BPS; forced regardless of price at DIRECT_DCA_MAX_BUYS
-  // or the hold cap.
-  const outOfFunds = usdm < amountIn;
-  if ((count >= DIRECT_DCA_MIN_BUYS || outOfFunds) && inventory > 0n) {
-    // Only CELO doubles as the gas token, so only CELO needs a reserve held
-    // back from the sell; a stable leg can be sold down to zero.
-    const headroom = mid === "CELO" ? (midBal > GAS_RESERVE_CELO ? midBal - GAS_RESERVE_CELO : 0n) : midBal;
-    const sellable = inventory < headroom ? inventory : headroom;
-    if (sellable > 0n) {
-      const [m, u] = await Promise.all([
-        getMentoQuote(mid, "USDm", sellable).then((q) => q?.amountOut ?? null).catch(() => null),
-        getUniswapQuote(mid, "USDm", sellable).catch(() => null),
-      ]);
-      const bestQuote = m !== null && u !== null ? (m > u ? m : u) : (m ?? u);
-      await accrueFee(uid, "check");
-      pingX402Check(mid, "USDm", Number(sellable / midUnit));
-      const basisPortion = (costBasis * sellable) / inventory;
-      const target = basisPortion + (basisPortion * BigInt(DIRECT_DCA_PROFIT_BPS)) / 10000n;
-      const heldMs = oldestAt ? Date.now() - oldestAt.getTime() : 0;
-      const takeProfit = bestQuote !== null && bestQuote >= target;
-      const forced = count >= DIRECT_DCA_MAX_BUYS || heldMs >= DIRECT_DCA_MAX_HOLD_MS;
-      if (takeProfit || forced) {
-        const why = takeProfit
-          ? `take-profit +${DIRECT_DCA_PROFIT_BPS}bps`
-          : count >= DIRECT_DCA_MAX_BUYS
-            ? `forced at ${count} buys`
-            : `forced at ${Math.round(heldMs / 60000)}min hold`;
-        const res = await executeDirectSwap(uid, mid, "USDm", sellable, DIRECT_MAX_SLIPPAGE_BPS, "dca", DIRECT_DCA_SELL_VENUE);
-        console.log(`${tag} dca sell ${mid}->USDm, closing a ${count}-buy cycle (${why}): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
-        return;
-      }
-      const held = `${Math.round(heldMs / 60000)}min`;
-      console.log(
-        `${tag} dca holding ${count} buys${outOfFunds ? " (out of USDm — this cycle is done buying)" : ""} at ${held} — quote under cost basis +${DIRECT_DCA_PROFIT_BPS}bps; sells anyway by ${DIRECT_DCA_MAX_HOLD_MS / 60000}min.`
-      );
-      // Out of USDm means there is no buy to fall through to.
-      if (outOfFunds) return;
-    }
-  }
-
-  // BUY: DIRECT_DCA_USDM of the mid token once a minute, price-independent.
-  // Gated on the last buy's timestamp, not the tick, so the cadence stays a
-  // real minute whatever HEARTBEAT_SECONDS is.
-  if (outOfFunds) {
-    console.log(`${tag} dca skipped — operator USDm ${(Number(usdm) / 1e18).toFixed(2)} is below the ${DIRECT_DCA_USDM} buy size and there is no inventory to sell. Top the wallet up.`);
-    return;
-  }
-  const lastBuy = await TradeLog.findOne({
-    userId: uid,
-    tokenIn: "USDm",
-    tokenOut: mid,
-    status: { $in: ["submitted", "settled"] },
-  }).sort({ createdAt: -1 });
-  if (lastBuy && Date.now() - lastBuy.createdAt.getTime() < DIRECT_DCA_INTERVAL_MS) return;
-  await accrueFee(uid, "check");
-  pingX402Check("USDm", mid, DIRECT_DCA_USDM);
-  const res = await executeDirectSwap(uid, "USDm", mid, amountIn, DIRECT_MAX_SLIPPAGE_BPS, "dca", DIRECT_DCA_BUY_VENUE);
-  console.log(`${tag} dca buy ${DIRECT_DCA_USDM} USDm->${mid} (buy ${count + 1} of this cycle): ${res.status}` + (res.txHash ? ` tx=${res.txHash}` : "") + ` (${res.reason})`);
-}
-
 async function tick() {
   if (ticking) return; // never let a slow tick overlap the next one
   ticking = true;
@@ -529,10 +416,6 @@ async function tick() {
 
   try {
     await connectDB();
-    if (OPERATOR_DIRECT_TRADING) {
-      await runDirectDca();
-      return;
-    }
     await reconcileVaultsFromChain();
     const users = await User.find({ vaultAddress: { $exists: true, $ne: null } });
     console.log(`Found ${users.length} user(s) with a vault.`);
