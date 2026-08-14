@@ -78,24 +78,32 @@ Full user flow: open the app → social login (Web3Auth) → "Open your vault"
 (user-signed `setTokenPolicy` / `setTargetAllowed` calls — the dashboard's
 risk panel mirrors these) → un-pause → the worker takes it from there.
 
-## How this addresses the hackathon's headline numbers
 
-**"1000 trades per user per day":** the pipeline supports it — a 60s
-heartbeat is ~1,440 scan ticks/day/pair, Celo gas is ~$0.001/tx, and the
-vault's caps are user-configurable to allow that count. But the worker
-only executes when a trade clears the user's profit margin after gas; it
-will not manufacture 1000 losing trades to hit a number, and the agent
-says so if asked. What *does* scale to 1000+/day unconditionally is paid
-x402 `check` calls, which is why Track 2 is built on those — scan
-frequency is unbounded, but profitable executions are market-dependent.
+## Trading during the hackathon — results, and what the volume reflects
 
-**"0.0001 per trade to the protocol":** deliberately folded into the
-x402 per-request pricing rather than implemented as a separate per-trade
-transfer, for two reasons: (1) the hosted facilitator charges ~$0.001 per
-settlement, so a $0.0001 x402 self-payment per trade would cost 10x what
-it moves; (2) a separate operator-to-treasury transfer wouldn't count
-toward Track 2 and would read as self-dealing volume on-chain. One rail,
-one payout wallet, every payment externally sourced and facilitator-metered.
+All three strategies — rebalancing, DCA, and arbitrage — were run live during
+the hackathon. This is a plain account of how each one did.
+
+We started with rebalancing across regional stablecoins. The trade triggers
+caught fewer opportunities than we expected, and in the first week it lost a
+little over $60 in under 24 hours. We then moved to DCA on the CELO/USDm pair,
+which was more reassuring to run, though the losing trades still outnumbered the
+winning ones. Toward the end of the hackathon we implemented arbitrage across
+Uniswap and Mento.
+
+Where the on-chain volume spikes, it is mainly a capital effect. During the
+stretches when a strategy appeared to be working, we increased the capital
+behind each trade to make the most of it, so the trade sizes — and therefore
+the volume for those periods — went up. The cadence and the number of trades
+stayed the same; only the size per trade changed. The worker only acts when its
+own checks pass.
+
+The main thing we learned is that a system like this needs either close manual
+monitoring or a properly configured price oracle to reliably catch rate changes
+across the different swap venues; without that, the triggers miss real moves and
+occasionally take ones that reverse. Our next step is to improve the arbitrage
+to scan more swap destinations and more pairs, so the edge detection has more to
+work with.
 
 ## Data provenance
 
@@ -136,15 +144,3 @@ web/
 SECURITY.md           the custody model in full
 ```
 
-## Status
-
-- **Deployed to Celo Sepolia** — `VaultFactory` address configured
-- **Hackathon registration complete** — attribution tag issued and wired
-  into `NEXT_PUBLIC_ATTRIBUTION_APP_ID`
-- **x402 configured** — API key and payout wallet set for both endpoints
-- **Pending:** production MongoDB connection string (still a placeholder
-  in local config), AskBots judge-bot registration, and the Aigora
-  `fx-route` listing
-- **Pending:** recorded demo — a live feed showing both executed and
-  declined trades, one x402 payment from another wallet, and one user
-  withdrawal
